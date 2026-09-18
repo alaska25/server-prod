@@ -1,7 +1,7 @@
+import mongoose from "mongoose";
 import Review from "../models/Review.js";
 import Book from "../models/Book.js";
 import User from "../models/User.js";
-import mongoose from "mongoose"; 
 
 const recalculateBookRating = async (bookId) => {
   const objectId = new mongoose.Types.ObjectId(bookId);
@@ -74,6 +74,39 @@ export const createReview = async (req, res) => {
     if (err.code === 11000) {
       return res.status(400).json({ message: "You've already reviewed this book" });
     }
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// PUT /api/books/:id/reviews/:reviewId (author only)
+export const updateReview = async (req, res) => {
+  try {
+    const { rating, comment } = req.body;
+    const review = await Review.findById(req.params.reviewId);
+    if (!review) return res.status(404).json({ message: "Review not found" });
+
+    if (review.user.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: "You can only edit your own review" });
+    }
+
+    if (rating !== undefined) {
+      if (rating < 1 || rating > 5) {
+        return res.status(400).json({ message: "Rating must be between 1 and 5" });
+      }
+      review.rating = rating;
+    }
+    if (comment !== undefined) {
+      if (!comment.trim()) {
+        return res.status(400).json({ message: "Comment cannot be empty" });
+      }
+      review.comment = comment.trim();
+    }
+
+    await review.save();
+    await recalculateBookRating(review.book);
+
+    res.json(review);
+  } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
