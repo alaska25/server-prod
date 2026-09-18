@@ -1,10 +1,13 @@
 import Review from "../models/Review.js";
 import Book from "../models/Book.js";
 import User from "../models/User.js";
+import mongoose from "mongoose"; 
 
 const recalculateBookRating = async (bookId) => {
+  const objectId = new mongoose.Types.ObjectId(bookId);
+
   const stats = await Review.aggregate([
-    { $match: { book: bookId } },
+    { $match: { book: objectId } },
     { $group: { _id: "$book", avgRating: { $avg: "$rating" }, count: { $sum: 1 } } },
   ]);
 
