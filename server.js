@@ -5,17 +5,12 @@ import connectDB from "./config/db.js";
 import authRoutes from "./routes/authRoutes.js";
 import bookRoutes from "./routes/bookRoutes.js";
 import orderRoutes from "./routes/orderRoutes.js";
-import { stripeWebhook } from "./controllers/orderController.js";
 
 connectDB();
 
 const app = express();
 
 app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
-
-// Stripe webhook needs the raw body, so it's mounted BEFORE express.json()
-app.post("/api/orders/webhook", express.raw({ type: "application/json" }), stripeWebhook);
-
 app.use(express.json());
 
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));

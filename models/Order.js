@@ -10,8 +10,9 @@ const orderSchema = new mongoose.Schema(
       },
     ],
     totalAmount: { type: Number, required: true },
-    stripeSessionId: { type: String },
-    stripePaymentIntentId: { type: String },
+    paypalOrderId: { type: String },
+    stripeSessionId: { type: String }, // kept for any pre-migration orders; unused going forward
+    stripePaymentIntentId: { type: String }, // kept for any pre-migration orders; unused going forward
     status: { type: String, enum: ["pending", "paid", "failed"], default: "pending" },
   },
   { timestamps: true }
