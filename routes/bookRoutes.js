@@ -7,6 +7,7 @@ import {
   getCategories,
   createBook,
   updateBook,
+  updateReview,
   deleteBook,
 } from "../controllers/bookController.js";
 import { getReviews, createReview, deleteReview } from "../controllers/reviewController.js";
@@ -24,6 +25,7 @@ router.post("/:id/claim", protect, claimFreeBook);
 router.get("/:id/reviews", getReviews);
 router.post("/:id/reviews", protect, createReview);
 router.delete("/:id/reviews/:reviewId", protect, deleteReview);
+router.put("/:id/reviews/:reviewId", protect, updateReview);
 
 router.post(
   "/",
