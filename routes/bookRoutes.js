@@ -7,10 +7,9 @@ import {
   getCategories,
   createBook,
   updateBook,
-  updateReview,
   deleteBook,
 } from "../controllers/bookController.js";
-import { getReviews, createReview, deleteReview } from "../controllers/reviewController.js";
+import { getReviews, createReview, updateReview, deleteReview } from "../controllers/reviewController.js";
 import { protect, admin } from "../middleware/auth.js";
 import upload from "../middleware/upload.js";
 
@@ -24,8 +23,8 @@ router.post("/:id/claim", protect, claimFreeBook);
 
 router.get("/:id/reviews", getReviews);
 router.post("/:id/reviews", protect, createReview);
-router.delete("/:id/reviews/:reviewId", protect, deleteReview);
 router.put("/:id/reviews/:reviewId", protect, updateReview);
+router.delete("/:id/reviews/:reviewId", protect, deleteReview);
 
 router.post(
   "/",
