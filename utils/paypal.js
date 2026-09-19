@@ -59,6 +59,12 @@ export const createPaypalOrder = async (totalAmount, referenceId) => {
           },
         },
       ],
+      // These are digital ebooks, not physical goods, so tell PayPal not to
+      // collect a shipping address. Without this, PayPal's checkout page
+      // can get stuck on the shipping step for digital-only purchases.
+      application_context: {
+        shipping_preference: "NO_SHIPPING",
+      },
     }),
   });
 
