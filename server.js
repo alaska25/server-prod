@@ -6,6 +6,7 @@ import authRoutes from "./routes/authRoutes.js";
 import bookRoutes from "./routes/bookRoutes.js";
 import orderRoutes from "./routes/orderRoutes.js";
 import supportRoutes from "./routes/supportRoutes.js";
+import newsletterRoutes from "./routes/newsletterRoutes.js";
 
 connectDB();
 
@@ -20,6 +21,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api/books", bookRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/support", supportRoutes);
+app.use("/api/newsletter", newsletterRoutes);
 
 // Central error handler
 app.use((err, req, res, next) => {
