@@ -3,6 +3,8 @@ import {
   getBooks,
   getBookById,
   getBookAccess,
+  getBookSample,
+  uploadBookSample,
   claimFreeBook,
   getCategories,
   createBook,
@@ -21,6 +23,16 @@ router.get("/:id", getBookById);
 router.get("/:id/access", protect, getBookAccess);
 router.post("/:id/claim", protect, claimFreeBook);
 
+// Public preview: no auth required, matches how the book detail page itself is public.
+router.get("/:id/sample", getBookSample);
+router.post(
+  "/:id/sample",
+  protect,
+  admin,
+  upload.fields([{ name: "sampleFile", maxCount: 1 }]),
+  uploadBookSample
+);
+
 router.get("/:id/reviews", getReviews);
 router.post("/:id/reviews", protect, createReview);
 router.put("/:id/reviews/:reviewId", protect, updateReview);
@@ -33,6 +45,7 @@ router.post(
   upload.fields([
     { name: "cover", maxCount: 1 },
     { name: "bookFile", maxCount: 1 },
+    { name: "sampleFile", maxCount: 1 },
   ]),
   createBook
 );
