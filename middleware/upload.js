@@ -14,6 +14,13 @@ const fileFilter = (req, file, cb) => {
   if (file.fieldname === "bookFile" && ALLOWED_BOOK_TYPES.includes(ext)) {
     return cb(null, true);
   }
+  // Sample files use the same allowed types as the main book file
+  // (bookController treats a sample's extension as "epub" or "pdf").
+  // This branch was missing, so every sampleFile upload fell through
+  // to the rejection below regardless of its extension.
+  if (file.fieldname === "sampleFile" && ALLOWED_BOOK_TYPES.includes(ext)) {
+    return cb(null, true);
+  }
   cb(new Error(`Unsupported file type for ${file.fieldname}: ${ext}`));
 };
 
@@ -25,7 +32,12 @@ const upload = multer({
     bucket: process.env.S3_BUCKET,
     contentType: multerS3.AUTO_CONTENT_TYPE,
     key: (req, file, cb) => {
-      const folder = file.fieldname === "cover" ? "covers" : "books";
+      const folder =
+        file.fieldname === "cover"
+          ? "covers"
+          : file.fieldname === "sampleFile"
+          ? "samples"
+          : "books";
       const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
       const ext = path.extname(file.originalname);
       cb(null, `${folder}/${unique}${ext}`);
