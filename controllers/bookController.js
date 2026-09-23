@@ -151,7 +151,18 @@ export const getCategories = async (req, res) => {
 // 'bookFile', and optionally a 'sampleFile' to seed the preview at creation time.
 export const createBook = async (req, res) => {
   try {
-    const { title, subtitle, author, description, category, price, isFree, featured } = req.body;
+    const {
+      title,
+      subtitle,
+      author,
+      description,
+      category,
+      price,
+      isFree,
+      featured,
+      pageCount,
+      publishedAt,
+    } = req.body;
     const coverFile = req.files?.cover?.[0];
     const bookFile = req.files?.bookFile?.[0];
     const sampleFile = req.files?.sampleFile?.[0];
@@ -182,6 +193,10 @@ export const createBook = async (req, res) => {
       price: isFree === "true" ? 0 : Number(price),
       isFree: isFree === "true",
       featured: featured === "true",
+      // Both optional: only set when the admin form actually sent a value,
+      // so an empty string doesn't get coerced into 0 or an invalid Date.
+      ...(pageCount !== undefined && pageCount !== "" ? { pageCount: Number(pageCount) } : {}),
+      ...(publishedAt !== undefined && publishedAt !== "" ? { publishedAt: new Date(publishedAt) } : {}),
       coverUrl: coverFile.location || publicUrl(coverFile.key),
       coverKey: coverFile.key,
       fileUrl: bookFile.location || publicUrl(bookFile.key),
@@ -202,7 +217,18 @@ export const updateBook = async (req, res) => {
     const book = await Book.findById(req.params.id);
     if (!book) return res.status(404).json({ message: "Book not found" });
 
-    const { title, subtitle, author, description, category, price, isFree, featured } = req.body;
+    const {
+      title,
+      subtitle,
+      author,
+      description,
+      category,
+      price,
+      isFree,
+      featured,
+      pageCount,
+      publishedAt,
+    } = req.body;
     if (title !== undefined) book.title = title;
     if (subtitle !== undefined) book.subtitle = subtitle;
     if (author !== undefined) book.author = author;
@@ -211,6 +237,9 @@ export const updateBook = async (req, res) => {
     if (price !== undefined) book.price = Number(price);
     if (isFree !== undefined) book.isFree = isFree === "true" || isFree === true;
     if (featured !== undefined) book.featured = featured === "true" || featured === true;
+    // Empty string clears the field back to unset; any other value sets it.
+    if (pageCount !== undefined) book.pageCount = pageCount === "" ? undefined : Number(pageCount);
+    if (publishedAt !== undefined) book.publishedAt = publishedAt === "" ? undefined : new Date(publishedAt);
 
     const updated = await book.save();
     res.json(updated);

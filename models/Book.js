@@ -18,6 +18,10 @@ const bookSchema = new mongoose.Schema(
     sampleUrl: { type: String },
     sampleKey: { type: String },
     sampleFileType: { type: String, enum: ["pdf", "epub"] },
+    // Optional metadata shown in the book details row on the frontend.
+    // Not required, so existing books without this data keep working fine.
+    pageCount: { type: Number, min: 0 },
+    publishedAt: { type: Date },
     isFree: { type: Boolean, default: false },
     featured: { type: Boolean, default: false },
     avgRating: { type: Number, default: 0 },
