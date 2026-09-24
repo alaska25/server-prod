@@ -8,16 +8,26 @@ import path from "path";
 const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
 
 // GET /api/books?search=&category=&page=&limit=
+// GET /api/books?search=&category=&free=&page=&limit=
 export const getBooks = async (req, res) => {
   try {
-    const { search, category, page = 1, limit = 12 } = req.query;
+    const { search, category, free, page = 1, limit = 12 } = req.query;
     const query = {};
 
-    if (search) {
-      query.$text = { $search: search };
+    const term = typeof search === "string" ? search.trim() : "";
+    // Searching for exactly "free" (what the "Start with a Free Title"
+    // buttons send) means "show free books", not a text match. `?free=true`
+    // does the same thing and can be combined with a category.
+    const wantsFree = free === "true" || term.toLowerCase() === "free";
+
+    if (term && term.toLowerCase() !== "free") {
+      query.$text = { $search: term };
     }
     if (category) {
       query.category = category;
+    }
+    if (wantsFree) {
+      query.isFree = true;
     }
 
     const skip = (Number(page) - 1) * Number(limit);
@@ -26,7 +36,7 @@ export const getBooks = async (req, res) => {
       Book.countDocuments(query),
     ]);
 
-    res.json({ books, total, page: Number(page), pages: Math.ceil(total / limit) });
+    res.json({ books, total, page: Number(page), pages: Math.ceil(total / Number(limit)) });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
