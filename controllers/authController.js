@@ -41,6 +41,13 @@ export const loginUser = async (req, res) => {
       return res.status(401).json({ message: "Invalid email or password" });
     }
 
+    // Rejected here, before a token is ever issued, so a deactivated user
+    // gets a clear message right at login instead of a token that then
+    // fails on their first API call.
+    if (!user.isActive) {
+      return res.status(403).json({ message: "This account has been deactivated." });
+    }
+
     res.json({
       _id: user._id,
       name: user.name,
