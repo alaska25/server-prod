@@ -24,6 +24,9 @@ const bookSchema = new mongoose.Schema(
     publishedAt: { type: Date },
     isFree: { type: Boolean, default: false },
     featured: { type: Boolean, default: false },
+    // Controls storefront visibility. Defaults to true so existing books
+    // stay visible the moment this field is introduced.
+    published: { type: Boolean, default: true },
     avgRating: { type: Number, default: 0 },
     reviewCount: { type: Number, default: 0 },
   },
