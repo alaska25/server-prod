@@ -14,7 +14,7 @@ import {
   deleteTemplate,
 } from "../controllers/templateController.js";
 import { protect, admin } from "../middleware/auth.js";
-import upload from "../middleware/upload.js";
+import uploadTemplateMemory from "../middleware/uploadTemplateMemory.js";
 
 const router = express.Router();
 
@@ -29,7 +29,7 @@ router.post(
   "/:id/cover",
   protect,
   admin,
-  upload.fields([{ name: "cover", maxCount: 1 }]),
+  uploadTemplateMemory.fields([{ name: "cover", maxCount: 1 }]),
   uploadTemplateCover
 );
 router.get("/:id/file", protect, admin, getTemplateFileAdmin);
@@ -37,7 +37,7 @@ router.post(
   "/:id/file",
   protect,
   admin,
-  upload.fields([{ name: "templateFile", maxCount: 1 }]),
+  uploadTemplateMemory.fields([{ name: "templateFile", maxCount: 1 }]),
   uploadTemplateFile
 );
 
@@ -45,7 +45,7 @@ router.post(
   "/",
   protect,
   admin,
-  upload.fields([
+  uploadTemplateMemory.fields([
     { name: "cover", maxCount: 1 },
     { name: "templateFile", maxCount: 1 },
   ]),

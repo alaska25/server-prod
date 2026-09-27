@@ -5,6 +5,7 @@ import s3 from "../utils/s3.js";
 
 const ALLOWED_COVER_TYPES = [".jpg", ".jpeg", ".png", ".webp"];
 const ALLOWED_BOOK_TYPES = [".pdf", ".epub"];
+const ALLOWED_TEMPLATE_TYPES = [".zip"];
 
 const fileFilter = (req, file, cb) => {
   const ext = path.extname(file.originalname).toLowerCase();
@@ -19,6 +20,9 @@ const fileFilter = (req, file, cb) => {
   // This branch was missing, so every sampleFile upload fell through
   // to the rejection below regardless of its extension.
   if (file.fieldname === "sampleFile" && ALLOWED_BOOK_TYPES.includes(ext)) {
+    return cb(null, true);
+  }
+  if (file.fieldname === "templateFile" && ALLOWED_TEMPLATE_TYPES.includes(ext)) {
     return cb(null, true);
   }
   cb(new Error(`Unsupported file type for ${file.fieldname}: ${ext}`));
@@ -37,6 +41,8 @@ const upload = multer({
           ? "covers"
           : file.fieldname === "sampleFile"
           ? "samples"
+          : file.fieldname === "templateFile"
+          ? "templates"
           : "books";
       const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
       const ext = path.extname(file.originalname);

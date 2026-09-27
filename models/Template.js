@@ -17,6 +17,10 @@ const templateSchema = new mongoose.Schema(
     fileUrl: { type: String, required: true },
     fileKey: { type: String, required: true },
     fileType: { type: String, enum: ["zip"], default: "zip" },
+    // Auto-extracted from the uploaded zip at upload time (see zipInspect.js)
+    // so buyers can preview the project's structure and docs before purchase.
+    readme: { type: String, default: "" },
+    fileTree: { type: [String], default: [] },
     featured: { type: Boolean, default: false },
     // Controls storefront visibility, same convention as Book.published.
     published: { type: Boolean, default: true },

@@ -1,10 +1,30 @@
 import Template from "../models/Template.js";
 import User from "../models/User.js";
-import { DeleteObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import s3 from "../utils/s3.js";
+import { inspectZip } from "../utils/zipInspect.js";
 
 const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
+
+// Uploads a buffer (from memory-storage multer) to S3 and returns its key/url.
+// folder: "covers" | "templates"
+async function uploadBufferToS3(buffer, originalName, contentType, folder) {
+  const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  const ext = originalName.slice(originalName.lastIndexOf("."));
+  const key = `${folder}/${unique}${ext}`;
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType,
+    })
+  );
+
+  return { key, url: publicUrl(key) };
+}
 
 // GET /api/templates?search=&category=&free=&page=&limit=
 export const getTemplates = async (req, res) => {
@@ -105,7 +125,7 @@ export const getTemplateFileAdmin = async (req, res) => {
   }
 };
 
-// POST /api/templates/:id/cover (admin)
+// POST /api/templates/:id/cover (admin) - now expects a buffer (memory storage)
 export const uploadTemplateCover = async (req, res) => {
   try {
     const template = await Template.findById(req.params.id);
@@ -113,6 +133,13 @@ export const uploadTemplateCover = async (req, res) => {
 
     const coverFile = req.files?.cover?.[0];
     if (!coverFile) return res.status(400).json({ message: "A cover image is required" });
+
+    const { key, url } = await uploadBufferToS3(
+      coverFile.buffer,
+      coverFile.originalname,
+      coverFile.mimetype,
+      "covers"
+    );
 
     if (template.coverKey) {
       try {
@@ -122,8 +149,8 @@ export const uploadTemplateCover = async (req, res) => {
       }
     }
 
-    template.coverKey = coverFile.key;
-    template.coverUrl = coverFile.location || publicUrl(coverFile.key);
+    template.coverKey = key;
+    template.coverUrl = url;
 
     const updated = await template.save();
     res.json(updated);
@@ -132,7 +159,7 @@ export const uploadTemplateCover = async (req, res) => {
   }
 };
 
-// POST /api/templates/:id/file (admin) - expects 'templateFile' field
+// POST /api/templates/:id/file (admin) - now expects a buffer (memory storage)
 export const uploadTemplateFile = async (req, res) => {
   try {
     const template = await Template.findById(req.params.id);
@@ -140,6 +167,15 @@ export const uploadTemplateFile = async (req, res) => {
 
     const templateFile = req.files?.templateFile?.[0];
     if (!templateFile) return res.status(400).json({ message: "A template zip file is required" });
+
+    const { readme, fileTree } = inspectZip(templateFile.buffer);
+
+    const { key, url } = await uploadBufferToS3(
+      templateFile.buffer,
+      templateFile.originalname,
+      templateFile.mimetype,
+      "templates"
+    );
 
     if (template.fileKey) {
       try {
@@ -149,9 +185,11 @@ export const uploadTemplateFile = async (req, res) => {
       }
     }
 
-    template.fileKey = templateFile.key;
-    template.fileUrl = templateFile.location || publicUrl(templateFile.key);
+    template.fileKey = key;
+    template.fileUrl = url;
     template.fileType = "zip";
+    template.readme = readme;
+    template.fileTree = fileTree;
 
     const updated = await template.save();
     res.json(updated);
@@ -183,7 +221,7 @@ export const getTemplateCategories = async (req, res) => {
   }
 };
 
-// POST /api/templates (admin) - expects 'cover' and 'templateFile'
+// POST /api/templates (admin) - expects 'cover' and 'templateFile' as buffers
 export const createTemplate = async (req, res) => {
   try {
     const { title, tagline, description, category, techStack, version, repoUrl, liveDemoUrl, price, isFree, featured } =
@@ -195,13 +233,19 @@ export const createTemplate = async (req, res) => {
       return res.status(400).json({ message: "Cover image and template zip are both required" });
     }
 
-    // techStack arrives as a comma-separated string from the admin form.
     const stackArray =
       typeof techStack === "string"
         ? techStack.split(",").map((s) => s.trim()).filter(Boolean)
         : Array.isArray(techStack)
         ? techStack
         : [];
+
+    const { readme, fileTree } = inspectZip(templateFile.buffer);
+
+    const [cover, file] = await Promise.all([
+      uploadBufferToS3(coverFile.buffer, coverFile.originalname, coverFile.mimetype, "covers"),
+      uploadBufferToS3(templateFile.buffer, templateFile.originalname, templateFile.mimetype, "templates"),
+    ]);
 
     const template = await Template.create({
       title,
@@ -215,11 +259,13 @@ export const createTemplate = async (req, res) => {
       price: isFree === "true" ? 0 : Number(price),
       isFree: isFree === "true",
       featured: featured === "true",
-      coverUrl: coverFile.location || publicUrl(coverFile.key),
-      coverKey: coverFile.key,
-      fileUrl: templateFile.location || publicUrl(templateFile.key),
-      fileKey: templateFile.key,
+      coverUrl: cover.url,
+      coverKey: cover.key,
+      fileUrl: file.url,
+      fileKey: file.key,
       fileType: "zip",
+      readme,
+      fileTree,
     });
 
     res.status(201).json(template);
