@@ -9,6 +9,11 @@ const userSchema = new mongoose.Schema(
     role: { type: String, enum: ["user", "admin", "superadmin"], default: "user" },
     isActive: { type: Boolean, default: true },
     library: [{ type: mongoose.Schema.Types.ObjectId, ref: "Book" }],
+    ownedTemplates: [{ type: mongoose.Schema.Types.ObjectId, ref: "Template" }],
+    // Optional profile photo, uploaded from the admin dashboard. Not
+    // required, so existing users without one keep working fine.
+    photoUrl: { type: String },
+    photoKey: { type: String },
   },
   { timestamps: true }
 );

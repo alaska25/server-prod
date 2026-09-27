@@ -9,6 +9,12 @@ const orderSchema = new mongoose.Schema(
         price: { type: Number, required: true },
       },
     ],
+    templates: [
+      {
+        template: { type: mongoose.Schema.Types.ObjectId, ref: "Template", required: true },
+        price: { type: Number, required: true },
+      },
+    ],
     totalAmount: { type: Number, required: true },
     paypalOrderId: { type: String },
     stripeSessionId: { type: String }, // kept for any pre-migration orders; unused going forward
