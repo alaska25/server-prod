@@ -15,9 +15,34 @@ const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
 // How long a reset link stays valid after being requested.
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
+// Verifies a Turnstile token server-side. Returns true only if Cloudflare
+// confirms the token is valid, unused, and was issued for this site.
+const verifyCaptcha = async (token, remoteIp) => {
+  if (!token) return false;
+
+  try {
+    const params = new URLSearchParams({
+      secret: process.env.TURNSTILE_SECRET_KEY,
+      response: token,
+    });
+    if (remoteIp) params.append("remoteip", remoteIp);
+
+    const verifyRes = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params,
+    });
+    const data = await verifyRes.json();
+    return data.success === true;
+  } catch (err) {
+    console.error("Turnstile verification error:", err.message);
+    return false;
+  }
+};
+
 export const registerUser = async (req, res) => {
   try {
-    const { name, password } = req.body;
+    const { name, password, captchaToken } = req.body;
     // The schema lowercases email on save, but that setter does NOT apply
     // to query filters — normalize here so the findOne below actually
     // catches existing accounts regardless of casing.
@@ -25,6 +50,11 @@ export const registerUser = async (req, res) => {
 
     if (!name || !email || !password) {
       return res.status(400).json({ message: "Name, email and password are required" });
+    }
+
+    const captchaOk = await verifyCaptcha(captchaToken, req.ip);
+    if (!captchaOk) {
+      return res.status(400).json({ message: "Captcha verification failed. Please try again." });
     }
 
     const existing = await User.findOne({ email });
