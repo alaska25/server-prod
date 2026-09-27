@@ -1,7 +1,9 @@
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 import User from "../models/User.js";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import s3 from "../utils/s3.js";
+import sendEmail from "../utils/sendEmail.js";
 
 const generateToken = (id) =>
   jwt.sign({ id }, process.env.JWT_SECRET, {
@@ -9,6 +11,9 @@ const generateToken = (id) =>
   });
 
 const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
+
+// How long a reset link stays valid after being requested.
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 export const registerUser = async (req, res) => {
   try {
@@ -67,6 +72,95 @@ export const loginUser = async (req, res) => {
       photoUrl: user.photoUrl,
       token: generateToken(user._id),
     });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// POST /api/auth/forgot-password
+// Always responds with the same generic message whether or not the email
+// belongs to an account — this prevents the endpoint being used to check
+// which emails are registered.
+export const forgotPassword = async (req, res) => {
+  try {
+    const email = req.body.email?.trim().toLowerCase();
+    if (!email) {
+      return res.status(400).json({ message: "Email is required" });
+    }
+
+    const genericResponse = {
+      message: "If an account exists for this email, we've sent a link to reset your password.",
+    };
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.json(genericResponse);
+    }
+
+    // Only the hash is stored; the raw token goes out in the email only,
+    // the same reasoning as never storing a plaintext password.
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    user.resetPasswordToken = crypto.createHash("sha256").update(rawToken).digest("hex");
+    user.resetPasswordExpires = Date.now() + RESET_TOKEN_TTL_MS;
+    await user.save({ validateBeforeSave: false });
+
+    const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${rawToken}`;
+
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: "Reset your Adyoolau password",
+        html: `
+          <p>Hi ${user.name},</p>
+          <p>Click the link below to set a new password. This link expires in 1 hour.</p>
+          <p><a href="${resetUrl}">${resetUrl}</a></p>
+          <p>If you didn't request this, you can safely ignore this email.</p>
+        `,
+      });
+    } catch (emailErr) {
+      // Roll back the token rather than leaving a valid, unusable reset
+      // request sitting on the account if the email genuinely failed to send.
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpires = undefined;
+      await user.save({ validateBeforeSave: false });
+      console.error("forgotPassword email error:", emailErr.message);
+      return res.status(500).json({ message: "Could not send reset email." });
+    }
+
+    res.json(genericResponse);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// POST /api/auth/reset-password
+export const resetPassword = async (req, res) => {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) {
+      return res.status(400).json({ message: "Token and new password are required" });
+    }
+    if (password.length < 6) {
+      return res.status(400).json({ message: "Password must be at least 6 characters" });
+    }
+
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
+
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: Date.now() },
+    }).select("+resetPasswordToken +resetPasswordExpires");
+
+    if (!user) {
+      return res.status(400).json({ message: "This reset link is invalid or has expired." });
+    }
+
+    user.password = password; // re-hashed by the pre-save hook
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    res.json({ message: "Password has been reset." });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

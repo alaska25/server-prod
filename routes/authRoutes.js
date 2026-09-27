@@ -2,6 +2,8 @@ import express from "express";
 import {
   registerUser,
   loginUser,
+  forgotPassword,
+  resetPassword,
   getProfile,
   getMyLibrary,
   uploadUserPhoto,
@@ -13,6 +15,8 @@ const router = express.Router();
 
 router.post("/register", registerUser);
 router.post("/login", loginUser);
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password", resetPassword);
 router.get("/profile", protect, getProfile);
 router.get("/library", protect, getMyLibrary);
 router.post("/photo", protect, upload.fields([{ name: "photo", maxCount: 1 }]), uploadUserPhoto);

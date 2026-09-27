@@ -14,6 +14,12 @@ const userSchema = new mongoose.Schema(
     // required, so existing users without one keep working fine.
     photoUrl: { type: String },
     photoKey: { type: String },
+    // Forgot-password flow. We only ever store a SHA-256 hash of the reset
+    // token (see authController.forgotPassword) — the raw token only ever
+    // exists in the emailed link, never in the database, the same reasoning
+    // as hashing the password itself.
+    resetPasswordToken: { type: String, select: false },
+    resetPasswordExpires: { type: Date, select: false },
   },
   { timestamps: true }
 );
