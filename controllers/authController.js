@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
+import { OAuth2Client } from "google-auth-library";
 import User from "../models/User.js";
 import { DeleteObjectCommand } from "@aws-sdk/client-s3";
 import s3 from "../utils/s3.js";
@@ -14,6 +15,8 @@ const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
 
 // How long a reset link stays valid after being requested.
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
 // Verifies a Turnstile token server-side. Returns true only if Cloudflare
 // confirms the token is valid, unused, and was issued for this site.
@@ -90,6 +93,78 @@ export const loginUser = async (req, res) => {
     // Rejected here, before a token is ever issued, so a deactivated user
     // gets a clear message right at login instead of a token that then
     // fails on their first API call.
+    if (!user.isActive) {
+      return res.status(403).json({ message: "This account has been deactivated." });
+    }
+
+    res.json({
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      photoUrl: user.photoUrl,
+      token: generateToken(user._id),
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+// POST /api/auth/google
+// Body: { credential } — the ID token string from Google Identity Services
+// on the frontend (google.accounts.id credential response).
+//
+// Verifies the token directly with Google (so a forged/expired token is
+// rejected before we ever trust the email in it), then finds a matching
+// user by googleId first, then by email (to link an existing
+// password-based account the first time they use Google), or creates a
+// brand-new account if neither exists. Returns the same shape as
+// loginUser/registerUser so the frontend can treat it identically.
+export const googleAuth = async (req, res) => {
+  try {
+    const { credential } = req.body;
+    if (!credential) {
+      return res.status(400).json({ message: "Missing Google credential" });
+    }
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: process.env.GOOGLE_CLIENT_ID,
+      });
+      payload = ticket.getPayload();
+    } catch (verifyErr) {
+      console.error("Google token verification error:", verifyErr.message);
+      return res.status(401).json({ message: "Could not verify Google account." });
+    }
+
+    if (!payload?.email) {
+      return res.status(401).json({ message: "Could not verify Google account." });
+    }
+
+    const email = payload.email.toLowerCase();
+    let user = await User.findOne({ googleId: payload.sub });
+
+    if (!user) {
+      // No account linked to this Google ID yet — check if an existing
+      // password-based account shares the email, and link it rather than
+      // creating a duplicate. Google verifies email ownership for us, so
+      // this is safe to do without an extra confirmation step.
+      user = await User.findOne({ email });
+      if (user) {
+        user.googleId = payload.sub;
+        await user.save();
+      } else {
+        user = await User.create({
+          name: payload.name || email.split("@")[0],
+          email,
+          googleId: payload.sub,
+          photoUrl: payload.picture,
+        });
+      }
+    }
+
     if (!user.isActive) {
       return res.status(403).json({ message: "This account has been deactivated." });
     }
