@@ -12,6 +12,10 @@ const transporter = smtpConfigured
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
       },
+      // Render's outbound networking doesn't reliably support IPv6, and
+      // Node sometimes resolves SMTP hosts (e.g. Gmail) to an IPv6 address
+      // first, causing ENETUNREACH. Forcing IPv4 avoids that entirely.
+      family: 4,
     })
   : null;
 
