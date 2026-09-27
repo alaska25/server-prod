@@ -35,6 +35,14 @@ export const updateUserRole = async (req, res) => {
     return res.status(404).json({ message: "User not found" });
   }
 
+  // A deactivated account shouldn't be promoted (or otherwise changed in
+  // role) while locked out — reactivate it first, then change the role.
+  // Enforced here too, not just hidden in the UI, since this endpoint could
+  // otherwise be called directly regardless of what the frontend disables.
+  if (!user.isActive) {
+    return res.status(400).json({ message: "Reactivate this account before changing its role" });
+  }
+
   // Stop demoting the last remaining superadmin.
   if (user.role === "superadmin" && role !== "superadmin") {
     const superadminCount = await User.countDocuments({ role: "superadmin", isActive: true });
