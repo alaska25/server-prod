@@ -9,6 +9,7 @@ import supportRoutes from "./routes/supportRoutes.js";
 import newsletterRoutes from "./routes/newsletterRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
 import statsRoutes from "./routes/statsRoutes.js";
+import templateRoutes from "./routes/templateRoutes.js";
 
 connectDB();
 
@@ -26,6 +27,7 @@ app.use("/api/support", supportRoutes);
 app.use("/api/newsletter", newsletterRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/stats", statsRoutes);
+app.use("/api/templates", templateRoutes);
 
 // Central error handler
 app.use((err, req, res, next) => {
