@@ -24,4 +24,10 @@ const orderSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Dashboard stats aggregations (statsController.js) all filter on status,
+// and several also filter/sort by createdAt — without these, every one of
+// those queries does a full collection scan.
+orderSchema.index({ status: 1, createdAt: -1 });
+orderSchema.index({ status: 1 });
+
 export default mongoose.model("Order", orderSchema);

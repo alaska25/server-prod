@@ -33,7 +33,9 @@ export const getDashboardStats = async (req, res) => {
     revenueByDayRaw,
     userGrowthRaw,
     topBooksRaw,
+    topTemplatesRaw,
     orderStatusRaw,
+    revenueSplitRaw,
   ] = await Promise.all([
     Order.aggregate([
       { $match: { status: "paid" } },
@@ -91,7 +93,53 @@ export const getDashboardStats = async (req, res) => {
         },
       },
     ]),
+    Order.aggregate([
+      { $match: { status: "paid" } },
+      { $unwind: "$templates" },
+      {
+        $group: {
+          _id: "$templates.template",
+          unitsSold: { $sum: 1 },
+          revenue: { $sum: "$templates.price" },
+        },
+      },
+      { $sort: { unitsSold: -1 } },
+      { $limit: 8 },
+      {
+        $lookup: {
+          from: "templates",
+          localField: "_id",
+          foreignField: "_id",
+          as: "template",
+        },
+      },
+      { $unwind: "$template" },
+      {
+        $project: {
+          _id: 0,
+          templateId: "$_id",
+          title: "$template.title",
+          unitsSold: 1,
+          revenue: 1,
+        },
+      },
+    ]),
     Order.aggregate([{ $group: { _id: "$status", count: { $sum: 1 } } }]),
+    Order.aggregate([
+      { $match: { status: "paid" } },
+      {
+        $facet: {
+          books: [
+            { $unwind: "$books" },
+            { $group: { _id: null, revenue: { $sum: "$books.price" } } },
+          ],
+          templates: [
+            { $unwind: "$templates" },
+            { $group: { _id: null, revenue: { $sum: "$templates.price" } } },
+          ],
+        },
+      },
+    ]),
   ]);
 
   // Fill every day in the window, defaulting to 0 where there's no data.
@@ -110,6 +158,17 @@ export const getDashboardStats = async (req, res) => {
 
   const orderStatus = orderStatusRaw.map((r) => ({ status: r._id, count: r.count }));
 
+  const revenueSplit = [
+    {
+      source: "books",
+      revenue: Math.round((revenueSplitRaw[0]?.books[0]?.revenue || 0) * 100) / 100,
+    },
+    {
+      source: "templates",
+      revenue: Math.round((revenueSplitRaw[0]?.templates[0]?.revenue || 0) * 100) / 100,
+    },
+  ];
+
   res.json({
     totals: {
       totalRevenue: Math.round((revenueAgg[0]?.total || 0) * 100) / 100,
@@ -120,6 +179,8 @@ export const getDashboardStats = async (req, res) => {
     revenueByDay,
     userGrowthByDay,
     topBooks: topBooksRaw,
+    topTemplates: topTemplatesRaw,
     orderStatus,
+    revenueSplit,
   });
 };
