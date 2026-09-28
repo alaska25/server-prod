@@ -28,6 +28,13 @@ const templateSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+// Full-text search.
 templateSchema.index({ title: "text", category: "text", techStack: "text" });
+
+// Listing indexes: without these, every list request scans the whole
+// collection and sorts it in memory.
+templateSchema.index({ published: 1, createdAt: -1 });
+templateSchema.index({ published: 1, category: 1, createdAt: -1 });
+templateSchema.index({ published: 1, isFree: 1, createdAt: -1 });
 
 export default mongoose.model("Template", templateSchema);

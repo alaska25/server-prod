@@ -7,11 +7,35 @@ import path from "path";
 
 const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
 
-// GET /api/books?search=&category=&page=&limit=
+// Fields the book cards / listing pages actually need. Keeping list
+// responses small (no description, no file keys) makes them much faster.
+// If a listing page shows something not in this list, add it here.
+const LIST_FIELDS =
+  "title subtitle author category price isFree featured fileType coverUrl pageCount avgRating reviewCount createdAt";
+
+// Never send the private book file location to the public.
+const HIDE_PRIVATE = "-fileUrl -fileKey";
+
+const MAX_LIMIT = 50;
+
+// Parses ?page and ?limit safely (defaults + upper cap).
+const parsePaging = (page, limit, defaultLimit, maxLimit = MAX_LIMIT) => {
+  const safeLimit = Math.min(Math.max(Number(limit) || defaultLimit, 1), maxLimit);
+  const safePage = Math.max(Number(page) || 1, 1);
+  return { safeLimit, safePage, skip: (safePage - 1) * safeLimit };
+};
+
+// Simple in-memory cache for the category list (rarely changes).
+let categoriesCache = { data: null, at: 0 };
+const CATEGORIES_TTL_MS = 5 * 60 * 1000;
+const clearCategoriesCache = () => {
+  categoriesCache = { data: null, at: 0 };
+};
+
 // GET /api/books?search=&category=&free=&page=&limit=
 export const getBooks = async (req, res) => {
   try {
-    const { search, category, free, page = 1, limit = 12 } = req.query;
+    const { search, category, free, page, limit } = req.query;
     const query = {};
 
     const term = typeof search === "string" ? search.trim() : "";
@@ -23,60 +47,70 @@ export const getBooks = async (req, res) => {
     if (term && term.toLowerCase() !== "free") {
       query.$text = { $search: term };
     }
-    if (category) {
+    if (typeof category === "string" && category) {
       query.category = category;
     }
     if (wantsFree) {
       query.isFree = true;
     }
-    // Hide unpublished books from the public listing. Uses $ne rather than
-    // an equality check so books saved before this field existed (where
-    // published is undefined) still show up as published by default.
+    // Hide unpublished books. Uses $ne so books saved before this field
+    // existed still show. Once every book has `published: true` (see the
+    // backfill note in the README/chat), change this to `= true` so the
+    // index can be used more efficiently.
     query.published = { $ne: false };
 
-    const skip = (Number(page) - 1) * Number(limit);
+    const { safeLimit, safePage, skip } = parsePaging(page, limit, 12);
+
     const [books, total] = await Promise.all([
-      Book.find(query).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
+      Book.find(query)
+        .select(LIST_FIELDS)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(safeLimit)
+        .lean(),
       Book.countDocuments(query),
     ]);
 
-    res.json({ books, total, page: Number(page), pages: Math.ceil(total / Number(limit)) });
+    res.json({ books, total, page: safePage, pages: Math.ceil(total / safeLimit) });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
 // GET /api/books/admin (admin) - same shape as the public listing, but
-// returns every book regardless of published status, so the admin table
-// doesn't lose track of books the moment they're unpublished.
+// returns every book regardless of published status.
 export const getBooksAdmin = async (req, res) => {
   try {
-    const { search, category, page = 1, limit = 100 } = req.query;
+    const { search, category, page, limit } = req.query;
     const query = {};
 
     const term = typeof search === "string" ? search.trim() : "";
     if (term) {
       query.$text = { $search: term };
     }
-    if (category) {
+    if (typeof category === "string" && category) {
       query.category = category;
     }
 
-    const skip = (Number(page) - 1) * Number(limit);
+    const { safeLimit, safePage, skip } = parsePaging(page, limit, 100, 200);
+
     const [books, total] = await Promise.all([
-      Book.find(query).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
+      Book.find(query).sort({ createdAt: -1 }).skip(skip).limit(safeLimit).lean(),
       Book.countDocuments(query),
     ]);
 
-    res.json({ books, total, page: Number(page), pages: Math.ceil(total / Number(limit)) });
+    res.json({ books, total, page: safePage, pages: Math.ceil(total / safeLimit) });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
+// GET /api/books/:id (public) - full detail, minus the private file location.
+// NOTE: if your admin edit form reads fileUrl/fileKey from this endpoint,
+// use the admin download route (GET /api/books/:id/file) instead.
 export const getBookById = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
+    const book = await Book.findById(req.params.id).select(HIDE_PRIVATE).lean();
     if (!book) return res.status(404).json({ message: "Book not found" });
     res.json(book);
   } catch (err) {
@@ -88,12 +122,12 @@ export const getBookById = async (req, res) => {
 // to read/download the book file, only if the user owns it (or it's free).
 export const getBookAccess = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
+    const book = await Book.findById(req.params.id).lean();
     if (!book) return res.status(404).json({ message: "Book not found" });
 
     if (!book.isFree) {
-      const user = await User.findById(req.user._id);
-      const owns = user.library.some((id) => id.toString() === book._id.toString());
+      // One lightweight query instead of loading the whole user document.
+      const owns = await User.exists({ _id: req.user._id, library: book._id });
       if (!owns) {
         return res.status(403).json({ message: "You don't own this book yet" });
       }
@@ -108,12 +142,11 @@ export const getBookAccess = async (req, res) => {
   }
 };
 
-// GET /api/books/:id/sample (public) - returns a time-limited signed URL to
-// the book's sample/preview file, if one has been uploaded. No ownership or
-// login required, same as browsing the book's detail page.
+// GET /api/books/:id/sample (public) - time-limited signed URL to the
+// book's sample/preview file, if one has been uploaded.
 export const getBookSample = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
+    const book = await Book.findById(req.params.id).lean();
     if (!book) return res.status(404).json({ message: "Book not found" });
 
     if (!book.sampleKey) {
@@ -141,7 +174,7 @@ export const uploadBookSample = async (req, res) => {
       return res.status(400).json({ message: "A sample file is required" });
     }
 
-    // Best-effort cleanup of the previous sample, if any, before saving the new one.
+    // Best-effort cleanup of the previous sample, if any.
     if (book.sampleKey) {
       try {
         await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.sampleKey }));
@@ -163,13 +196,11 @@ export const uploadBookSample = async (req, res) => {
   }
 };
 
-// GET /api/books/:id/file (admin) - returns a time-limited signed URL to
-// download the current book file, regardless of ownership. Used on the
-// admin edit form so the current manuscript can be downloaded before
-// it's replaced.
+// GET /api/books/:id/file (admin) - signed URL to download the current book
+// file regardless of ownership (used on the admin edit form).
 export const getBookFileAdmin = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
+    const book = await Book.findById(req.params.id).lean();
     if (!book) return res.status(404).json({ message: "Book not found" });
 
     const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.fileKey });
@@ -181,8 +212,7 @@ export const getBookFileAdmin = async (req, res) => {
   }
 };
 
-// POST /api/books/:id/cover (admin) - expects multipart/form-data with a
-// single 'cover' field. Replaces the existing cover image for this book.
+// POST /api/books/:id/cover (admin) - single 'cover' field.
 export const uploadBookCover = async (req, res) => {
   try {
     const book = await Book.findById(req.params.id);
@@ -193,7 +223,7 @@ export const uploadBookCover = async (req, res) => {
       return res.status(400).json({ message: "A cover image is required" });
     }
 
-    // Best-effort cleanup of the previous cover before saving the new one.
+    // Best-effort cleanup of the previous cover.
     if (book.coverKey) {
       try {
         await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.coverKey }));
@@ -212,8 +242,7 @@ export const uploadBookCover = async (req, res) => {
   }
 };
 
-// POST /api/books/:id/file (admin) - expects multipart/form-data with a
-// single 'bookFile' field. Replaces the existing book file for this book.
+// POST /api/books/:id/file (admin) - single 'bookFile' field.
 export const uploadBookFile = async (req, res) => {
   try {
     const book = await Book.findById(req.params.id);
@@ -224,7 +253,7 @@ export const uploadBookFile = async (req, res) => {
       return res.status(400).json({ message: "A book file is required" });
     }
 
-    // Best-effort cleanup of the previous file before saving the new one.
+    // Best-effort cleanup of the previous file.
     if (book.fileKey) {
       try {
         await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.fileKey }));
@@ -250,7 +279,7 @@ export const uploadBookFile = async (req, res) => {
 // user's library without going through Stripe checkout.
 export const claimFreeBook = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
+    const book = await Book.findById(req.params.id).select("isFree").lean();
     if (!book) return res.status(404).json({ message: "Book not found" });
     if (!book.isFree) {
       return res.status(400).json({ message: "This book is not free" });
@@ -263,17 +292,22 @@ export const claimFreeBook = async (req, res) => {
   }
 };
 
+// GET /api/books/categories - cached for a few minutes.
 export const getCategories = async (req, res) => {
   try {
+    if (categoriesCache.data && Date.now() - categoriesCache.at < CATEGORIES_TTL_MS) {
+      return res.json(categoriesCache.data);
+    }
     const categories = await Book.distinct("category");
+    categoriesCache = { data: categories, at: Date.now() };
     res.json(categories);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// POST /api/books (admin) - expects multipart/form-data with 'cover' and
-// 'bookFile', and optionally a 'sampleFile' to seed the preview at creation time.
+// POST /api/books (admin) - multipart/form-data with 'cover' and 'bookFile',
+// and optionally a 'sampleFile' to seed the preview at creation time.
 export const createBook = async (req, res) => {
   try {
     const {
@@ -330,13 +364,15 @@ export const createBook = async (req, res) => {
       ...sampleFields,
     });
 
+    clearCategoriesCache();
     res.status(201).json(book);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// PUT /api/books/:id (admin) - text fields only; use separate routes for replacing files if needed
+// PUT /api/books/:id (admin) - text fields only; use the separate routes
+// for replacing files.
 export const updateBook = async (req, res) => {
   try {
     const book = await Book.findById(req.params.id);
@@ -369,6 +405,7 @@ export const updateBook = async (req, res) => {
     if (published !== undefined) book.published = published === "true" || published === true;
 
     const updated = await book.save();
+    clearCategoriesCache();
     res.json(updated);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -392,6 +429,7 @@ export const deleteBook = async (req, res) => {
     }
 
     await book.deleteOne();
+    clearCategoriesCache();
     res.json({ message: "Book deleted" });
   } catch (err) {
     res.status(500).json({ message: err.message });
