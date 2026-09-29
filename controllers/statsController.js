@@ -3,6 +3,13 @@ import User from "../models/User.js";
 import Book from "../models/Book.js";
 
 const DAYS_BACK = 30;
+const CACHE_TTL_MS = 60 * 1000; // 60 seconds
+
+// Dashboard numbers don't need to be accurate to the second, so cache the
+// full response briefly. Turns repeated visits/refreshes within the same
+// minute into an instant response instead of re-running 9 aggregations
+// every time.
+let statsCache = { data: null, at: 0 };
 
 const dayKey = (date) => date.toISOString().slice(0, 10); // "YYYY-MM-DD"
 
@@ -21,6 +28,10 @@ const lastNDayKeys = (days) => {
 
 // GET /stats/dashboard — superadmin-only, see statsRoutes.js.
 export const getDashboardStats = async (req, res) => {
+  if (statsCache.data && Date.now() - statsCache.at < CACHE_TTL_MS) {
+    return res.json(statsCache.data);
+  }
+
   const since = new Date();
   since.setUTCDate(since.getUTCDate() - (DAYS_BACK - 1));
   since.setUTCHours(0, 0, 0, 0);
@@ -169,7 +180,7 @@ export const getDashboardStats = async (req, res) => {
     },
   ];
 
-  res.json({
+  const payload = {
     totals: {
       totalRevenue: Math.round((revenueAgg[0]?.total || 0) * 100) / 100,
       totalOrders,
@@ -182,5 +193,8 @@ export const getDashboardStats = async (req, res) => {
     topTemplates: topTemplatesRaw,
     orderStatus,
     revenueSplit,
-  });
+  };
+
+  statsCache = { data: payload, at: Date.now() };
+  res.json(payload);
 };
