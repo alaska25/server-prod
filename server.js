@@ -65,9 +65,9 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(compression());
 
 // CLIENT_URL may hold several origins, comma separated
-// (e.g. "https://example.com,https://www.example.com").
+// (e.g. "https://example.com,https://example.com").
 const allowedOrigins = process.env.CLIENT_URL.split(",")
-  .map((s) => s.trim().replace(/\/$/, ""))
+  .map((s) => s.trim().replace(/\/\$/, ""))
   .filter(Boolean);
 
 app.use(
@@ -120,12 +120,17 @@ app.use((err, req, res, next) => {
 });
 
 // ---- Start: connect to the database first, then listen -------------------
-const PORT = process.env.PORT || 5000;
+// Render expects port 10000 by default if process.env.PORT is omitted
+const PORT = process.env.PORT || 10000;
 let server;
 
 try {
   await connectDB(); // connectDB must throw on failure (not swallow the error)
-  server = app.listen(PORT, () => console.log(`Adyoolau API running on port ${PORT}`));
+  
+  // Binding to '0.0.0.0' allows external proxy servers like Render to forward traffic here
+  server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Adyoolau API running on port ${PORT}`);
+  });
 } catch (err) {
   console.error("Startup failed:", err.message);
   process.exit(1);
