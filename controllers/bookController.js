@@ -9,12 +9,18 @@ const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
 
 // Fields the book cards / listing pages actually need. Keeping list
 // responses small (no description, no file keys) makes them much faster.
-// If a listing page shows something not in this list, add it here.
 const LIST_FIELDS =
   "title subtitle author category price isFree featured fileType coverUrl pageCount avgRating reviewCount createdAt";
 
 // Never send the private book file location to the public.
+// (fileUrl/fileKey are also `select: false` in the Book schema.)
 const HIDE_PRIVATE = "-fileUrl -fileKey";
+
+// Storefront visibility filter. `$ne: false` also matches books saved before
+// the `published` field existed. Once every book has `published: true`
+// (run the backfill in CHANGES.md), change this to `true` so the listing
+// indexes are used fully (no in-memory sort).
+const PUBLISHED_FILTER = { $ne: false };
 
 const MAX_LIMIT = 50;
 
@@ -25,12 +31,60 @@ const parsePaging = (page, limit, defaultLimit, maxLimit = MAX_LIMIT) => {
   return { safeLimit, safePage, skip: (safePage - 1) * safeLimit };
 };
 
+// ---- Small helpers --------------------------------------------------------
+
+// Sends a safe error response. Validation problems are the client's fault (400);
+// everything else is logged and answered with a generic message.
+const handleError = (res, err, label) => {
+  if (err?.name === "ValidationError") {
+    return res.status(400).json({ message: Object.values(err.errors).map((e) => e.message).join(", ") });
+  }
+  if (err?.name === "CastError") {
+    return res.status(400).json({ message: "Invalid value" });
+  }
+  console.error(`${label}:`, err);
+  return res.status(500).json({ message: "Server error" });
+};
+
+// Best-effort S3 deletes; never throws.
+const removeFromS3 = async (...keys) => {
+  await Promise.all(
+    keys.filter(Boolean).map(async (Key) => {
+      try {
+        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key }));
+      } catch (s3Err) {
+        console.warn("S3 cleanup warning:", s3Err.message);
+      }
+    })
+  );
+};
+
+// Keys of files multer already uploaded for this request. Used to clean up
+// when the request then fails, so orphaned files don't pile up in the bucket.
+const uploadedKeys = (req) =>
+  Object.values(req.files || {})
+    .flat()
+    .map((f) => f.key);
+
 // Simple in-memory cache for the category list (rarely changes).
 let categoriesCache = { data: null, at: 0 };
 const CATEGORIES_TTL_MS = 5 * 60 * 1000;
 const clearCategoriesCache = () => {
   categoriesCache = { data: null, at: 0 };
 };
+
+// Cache of signed sample URLs, so repeated previews reuse one URL (which the
+// browser can then cache too) instead of generating a new one every time.
+const sampleCache = new Map(); // bookId -> { data, expires }
+const SAMPLE_CACHE_MS = 30 * 60 * 1000;
+const SAMPLE_CACHE_MAX = 500;
+
+const clearBookCaches = (id) => {
+  clearCategoriesCache();
+  if (id) sampleCache.delete(String(id));
+};
+
+// ---- Public listing -------------------------------------------------------
 
 // GET /api/books?search=&category=&free=&page=&limit=
 export const getBooks = async (req, res) => {
@@ -53,11 +107,7 @@ export const getBooks = async (req, res) => {
     if (wantsFree) {
       query.isFree = true;
     }
-    // Hide unpublished books. Uses $ne so books saved before this field
-    // existed still show. Once every book has `published: true` (see the
-    // backfill note in the README/chat), change this to `= true` so the
-    // index can be used more efficiently.
-    query.published = { $ne: false };
+    query.published = PUBLISHED_FILTER;
 
     const { safeLimit, safePage, skip } = parsePaging(page, limit, 12);
 
@@ -73,7 +123,7 @@ export const getBooks = async (req, res) => {
 
     res.json({ books, total, page: safePage, pages: Math.ceil(total / safeLimit) });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "getBooks");
   }
 };
 
@@ -101,36 +151,57 @@ export const getBooksAdmin = async (req, res) => {
 
     res.json({ books, total, page: safePage, pages: Math.ceil(total / safeLimit) });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "getBooksAdmin");
   }
 };
 
-// GET /api/books/:id (public) - full detail, minus the private file location.
-// NOTE: if your admin edit form reads fileUrl/fileKey from this endpoint,
-// use the admin download route (GET /api/books/:id/file) instead.
+// GET /api/books/:id (public) - full detail of a PUBLISHED book, minus the
+// private file location.
 export const getBookById = async (req, res) => {
   try {
     const book = await Book.findById(req.params.id).select(HIDE_PRIVATE).lean();
-    if (!book) return res.status(404).json({ message: "Book not found" });
+    if (!book || book.published === false) {
+      return res.status(404).json({ message: "Book not found" });
+    }
     res.json(book);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "getBookById");
   }
 };
 
-// GET /api/books/:id/access (protected) - returns a time-limited signed URL
-// to read/download the book file, only if the user owns it (or it's free).
-export const getBookAccess = async (req, res) => {
+// GET /api/books/admin/:id (admin) - full detail including unpublished books
+// (for the admin edit form). Still excludes the private file location; use
+// GET /api/books/:id/file to download the book file.
+export const getBookByIdAdmin = async (req, res) => {
   try {
     const book = await Book.findById(req.params.id).lean();
     if (!book) return res.status(404).json({ message: "Book not found" });
+    res.json(book);
+  } catch (err) {
+    handleError(res, err, "getBookByIdAdmin");
+  }
+};
 
-    if (!book.isFree) {
-      // One lightweight query instead of loading the whole user document.
-      const owns = await User.exists({ _id: req.user._id, library: book._id });
-      if (!owns) {
-        return res.status(403).json({ message: "You don't own this book yet" });
-      }
+// ---- Access to book files -------------------------------------------------
+
+// GET /api/books/:id/access (protected) - returns a time-limited signed URL
+// to read/download the book file, only if the user owns it (or it's free).
+// People who already own a book keep access even if it is later unpublished.
+export const getBookAccess = async (req, res) => {
+  try {
+    const book = await Book.findById(req.params.id)
+      .select("+fileKey title isFree fileType published")
+      .lean();
+    if (!book) return res.status(404).json({ message: "Book not found" });
+
+    // One lightweight query instead of loading the whole user document.
+    const owns = await User.exists({ _id: req.user._id, library: book._id });
+
+    if (book.published === false && !owns) {
+      return res.status(404).json({ message: "Book not found" });
+    }
+    if (!book.isFree && !owns) {
+      return res.status(403).json({ message: "You don't own this book yet" });
     }
 
     const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.fileKey });
@@ -138,7 +209,7 @@ export const getBookAccess = async (req, res) => {
 
     res.json({ url: signedUrl, fileType: book.fileType, title: book.title });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "getBookAccess");
   }
 };
 
@@ -146,53 +217,39 @@ export const getBookAccess = async (req, res) => {
 // book's sample/preview file, if one has been uploaded.
 export const getBookSample = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id).lean();
-    if (!book) return res.status(404).json({ message: "Book not found" });
+    const id = req.params.id;
 
+    const hit = sampleCache.get(id);
+    if (hit && hit.expires > Date.now()) {
+      res.set("Cache-Control", "public, max-age=300");
+      return res.json(hit.data);
+    }
+
+    // Only the few fields needed, not the whole document.
+    const book = await Book.findById(id).select("title sampleKey sampleFileType published").lean();
+    if (!book || book.published === false) {
+      return res.status(404).json({ message: "Book not found" });
+    }
     if (!book.sampleKey) {
       return res.status(404).json({ message: "No sample is available for this book yet" });
     }
 
-    const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.sampleKey });
+    const command = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: book.sampleKey,
+      ResponseCacheControl: "public, max-age=3600",
+    });
     const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 60 }); // 1 hour
 
-    res.json({ url: signedUrl, fileType: book.sampleFileType, title: book.title });
+    const data = { url: signedUrl, fileType: book.sampleFileType, title: book.title };
+
+    if (sampleCache.size >= SAMPLE_CACHE_MAX) sampleCache.clear();
+    sampleCache.set(id, { data, expires: Date.now() + SAMPLE_CACHE_MS });
+
+    res.set("Cache-Control", "public, max-age=300");
+    res.json(data);
   } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-};
-
-// POST /api/books/:id/sample (admin) - expects multipart/form-data with a
-// single 'sampleFile' field. Replaces any existing sample for this book.
-export const uploadBookSample = async (req, res) => {
-  try {
-    const book = await Book.findById(req.params.id);
-    if (!book) return res.status(404).json({ message: "Book not found" });
-
-    const sampleFile = req.files?.sampleFile?.[0];
-    if (!sampleFile) {
-      return res.status(400).json({ message: "A sample file is required" });
-    }
-
-    // Best-effort cleanup of the previous sample, if any.
-    if (book.sampleKey) {
-      try {
-        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.sampleKey }));
-      } catch (s3Err) {
-        console.warn("S3 cleanup warning (old sample):", s3Err.message);
-      }
-    }
-
-    const ext = path.extname(sampleFile.originalname).toLowerCase().replace(".", "");
-
-    book.sampleKey = sampleFile.key;
-    book.sampleUrl = sampleFile.location || publicUrl(sampleFile.key);
-    book.sampleFileType = ext === "epub" ? "epub" : "pdf";
-
-    const updated = await book.save();
-    res.json(updated);
-  } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "getBookSample");
   }
 };
 
@@ -200,7 +257,7 @@ export const uploadBookSample = async (req, res) => {
 // file regardless of ownership (used on the admin edit form).
 export const getBookFileAdmin = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id).lean();
+    const book = await Book.findById(req.params.id).select("+fileKey title fileType").lean();
     if (!book) return res.status(404).json({ message: "Book not found" });
 
     const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.fileKey });
@@ -208,7 +265,44 @@ export const getBookFileAdmin = async (req, res) => {
 
     res.json({ url: signedUrl, fileType: book.fileType, title: book.title });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "getBookFileAdmin");
+  }
+};
+
+// ---- Admin file uploads ---------------------------------------------------
+// Pattern for all three: save the new key first, and only then delete the old
+// object, so a failed save can never leave the database pointing at a deleted
+// file. If anything fails, the newly uploaded files are removed again.
+
+// POST /api/books/:id/sample (admin) - single 'sampleFile' field.
+export const uploadBookSample = async (req, res) => {
+  try {
+    const book = await Book.findById(req.params.id);
+    if (!book) {
+      await removeFromS3(...uploadedKeys(req));
+      return res.status(404).json({ message: "Book not found" });
+    }
+
+    const sampleFile = req.files?.sampleFile?.[0];
+    if (!sampleFile) {
+      return res.status(400).json({ message: "A sample file is required" });
+    }
+
+    const oldKey = book.sampleKey;
+    const ext = path.extname(sampleFile.originalname).toLowerCase().replace(".", "");
+
+    book.sampleKey = sampleFile.key;
+    book.sampleUrl = sampleFile.location || publicUrl(sampleFile.key);
+    book.sampleFileType = ext === "epub" ? "epub" : "pdf";
+
+    const updated = await book.save();
+    await removeFromS3(oldKey);
+    clearBookCaches(book._id);
+
+    res.json(updated);
+  } catch (err) {
+    await removeFromS3(...uploadedKeys(req));
+    handleError(res, err, "uploadBookSample");
   }
 };
 
@@ -216,52 +310,46 @@ export const getBookFileAdmin = async (req, res) => {
 export const uploadBookCover = async (req, res) => {
   try {
     const book = await Book.findById(req.params.id);
-    if (!book) return res.status(404).json({ message: "Book not found" });
+    if (!book) {
+      await removeFromS3(...uploadedKeys(req));
+      return res.status(404).json({ message: "Book not found" });
+    }
 
     const coverFile = req.files?.cover?.[0];
     if (!coverFile) {
       return res.status(400).json({ message: "A cover image is required" });
     }
 
-    // Best-effort cleanup of the previous cover.
-    if (book.coverKey) {
-      try {
-        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.coverKey }));
-      } catch (s3Err) {
-        console.warn("S3 cleanup warning (old cover):", s3Err.message);
-      }
-    }
+    const oldKey = book.coverKey;
 
     book.coverKey = coverFile.key;
     book.coverUrl = coverFile.location || publicUrl(coverFile.key);
 
     const updated = await book.save();
+    await removeFromS3(oldKey);
+
     res.json(updated);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    await removeFromS3(...uploadedKeys(req));
+    handleError(res, err, "uploadBookCover");
   }
 };
 
 // POST /api/books/:id/file (admin) - single 'bookFile' field.
 export const uploadBookFile = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
-    if (!book) return res.status(404).json({ message: "Book not found" });
+    const book = await Book.findById(req.params.id).select("+fileKey +fileUrl");
+    if (!book) {
+      await removeFromS3(...uploadedKeys(req));
+      return res.status(404).json({ message: "Book not found" });
+    }
 
     const bookFile = req.files?.bookFile?.[0];
     if (!bookFile) {
       return res.status(400).json({ message: "A book file is required" });
     }
 
-    // Best-effort cleanup of the previous file.
-    if (book.fileKey) {
-      try {
-        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.fileKey }));
-      } catch (s3Err) {
-        console.warn("S3 cleanup warning (old book file):", s3Err.message);
-      }
-    }
-
+    const oldKey = book.fileKey;
     const ext = path.extname(bookFile.originalname).toLowerCase().replace(".", "");
 
     book.fileKey = bookFile.key;
@@ -269,18 +357,25 @@ export const uploadBookFile = async (req, res) => {
     book.fileType = ext === "epub" ? "epub" : "pdf";
 
     const updated = await book.save();
+    await removeFromS3(oldKey);
+
     res.json(updated);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    await removeFromS3(...uploadedKeys(req));
+    handleError(res, err, "uploadBookFile");
   }
 };
 
+// ---- Claiming, categories -------------------------------------------------
+
 // POST /api/books/:id/claim (protected) - grants a free book directly to the
-// user's library without going through Stripe checkout.
+// user's library without going through checkout.
 export const claimFreeBook = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id).select("isFree").lean();
-    if (!book) return res.status(404).json({ message: "Book not found" });
+    const book = await Book.findById(req.params.id).select("isFree published").lean();
+    if (!book || book.published === false) {
+      return res.status(404).json({ message: "Book not found" });
+    }
     if (!book.isFree) {
       return res.status(400).json({ message: "This book is not free" });
     }
@@ -288,7 +383,7 @@ export const claimFreeBook = async (req, res) => {
     await User.findByIdAndUpdate(req.user._id, { $addToSet: { library: book._id } });
     res.json({ message: "Book added to your library" });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "claimFreeBook");
   }
 };
 
@@ -298,13 +393,15 @@ export const getCategories = async (req, res) => {
     if (categoriesCache.data && Date.now() - categoriesCache.at < CATEGORIES_TTL_MS) {
       return res.json(categoriesCache.data);
     }
-    const categories = await Book.distinct("category");
+    const categories = await Book.distinct("category", { published: PUBLISHED_FILTER });
     categoriesCache = { data: categories, at: Date.now() };
     res.json(categories);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "getCategories");
   }
 };
+
+// ---- Admin create / update / delete --------------------------------------
 
 // POST /api/books (admin) - multipart/form-data with 'cover' and 'bookFile',
 // and optionally a 'sampleFile' to seed the preview at creation time.
@@ -327,6 +424,7 @@ export const createBook = async (req, res) => {
     const sampleFile = req.files?.sampleFile?.[0];
 
     if (!coverFile || !bookFile) {
+      await removeFromS3(...uploadedKeys(req));
       return res.status(400).json({ message: "Cover image and book file are both required" });
     }
 
@@ -349,6 +447,7 @@ export const createBook = async (req, res) => {
       author,
       description,
       category,
+      // A non-numeric price fails schema validation and returns 400.
       price: isFree === "true" ? 0 : Number(price),
       isFree: isFree === "true",
       featured: featured === "true",
@@ -364,10 +463,11 @@ export const createBook = async (req, res) => {
       ...sampleFields,
     });
 
-    clearCategoriesCache();
+    clearBookCaches();
     res.status(201).json(book);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    await removeFromS3(...uploadedKeys(req));
+    handleError(res, err, "createBook");
   }
 };
 
@@ -404,34 +504,39 @@ export const updateBook = async (req, res) => {
     if (publishedAt !== undefined) book.publishedAt = publishedAt === "" ? undefined : new Date(publishedAt);
     if (published !== undefined) book.published = published === "true" || published === true;
 
-    const updated = await book.save();
-    clearCategoriesCache();
+    const updated = await book.save(); // schema hook keeps free books at price 0
+    clearBookCaches(book._id);
     res.json(updated);
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "updateBook");
   }
 };
 
+// DELETE /api/books/:id (admin)
+// A book that customers already own is never hard-deleted (that would remove
+// files people paid for and leave dangling entries in their libraries). It is
+// unpublished instead, which hides it from the storefront.
 export const deleteBook = async (req, res) => {
   try {
-    const book = await Book.findById(req.params.id);
+    const book = await Book.findById(req.params.id).select("+fileKey");
     if (!book) return res.status(404).json({ message: "Book not found" });
 
-    // Best-effort cleanup of S3 objects
-    try {
-      await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.coverKey }));
-      await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.fileKey }));
-      if (book.sampleKey) {
-        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: book.sampleKey }));
-      }
-    } catch (s3Err) {
-      console.warn("S3 cleanup warning:", s3Err.message);
+    const hasOwners = await User.exists({ library: book._id });
+    if (hasOwners) {
+      book.published = false;
+      await book.save();
+      clearBookCaches(book._id);
+      return res.json({
+        message: "This book has customers, so it was unpublished instead of deleted.",
+        unpublished: true,
+      });
     }
 
     await book.deleteOne();
-    clearCategoriesCache();
+    await removeFromS3(book.coverKey, book.fileKey, book.sampleKey);
+    clearBookCaches(book._id);
     res.json({ message: "Book deleted" });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    handleError(res, err, "deleteBook");
   }
 };

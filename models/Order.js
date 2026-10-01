@@ -6,28 +6,44 @@ const orderSchema = new mongoose.Schema(
     books: [
       {
         book: { type: mongoose.Schema.Types.ObjectId, ref: "Book", required: true },
-        price: { type: Number, required: true },
+        // Snapshot at purchase time, so order history still reads correctly
+        // after a book is renamed or removed.
+        title: { type: String },
+        coverUrl: { type: String },
+        price: { type: Number, required: true, min: 0 },
       },
     ],
     templates: [
       {
         template: { type: mongoose.Schema.Types.ObjectId, ref: "Template", required: true },
-        price: { type: Number, required: true },
+        title: { type: String },
+        coverUrl: { type: String },
+        price: { type: Number, required: true, min: 0 },
       },
     ],
-    totalAmount: { type: Number, required: true },
+    totalAmount: { type: Number, required: true, min: 0 },
+    currency: { type: String, default: "USD" },
     paypalOrderId: { type: String },
-    stripeSessionId: { type: String }, // kept for any pre-migration orders; unused going forward
-    stripePaymentIntentId: { type: String }, // kept for any pre-migration orders; unused going forward
-    status: { type: String, enum: ["pending", "paid", "failed"], default: "pending" },
+    paypalCaptureId: { type: String },
+    paidAt: { type: Date },
+    stripeSessionId: { type: String }, // legacy: pre-migration orders only
+    stripePaymentIntentId: { type: String }, // legacy: pre-migration orders only
+    status: {
+      type: String,
+      // pending_review: PayPal capture is PENDING (payment under review)
+      // needs_review:   captured amount/currency did not match; check manually
+      enum: ["pending", "pending_review", "needs_review", "paid", "failed"],
+      default: "pending",
+    },
   },
   { timestamps: true }
 );
 
-// Dashboard stats aggregations (statsController.js) all filter on status,
-// and several also filter/sort by createdAt — without these, every one of
-// those queries does a full collection scan.
-orderSchema.index({ status: 1, createdAt: -1 });
-orderSchema.index({ status: 1 });
+// One PayPal order / capture can only ever belong to one Order.
+// sparse: these fields are absent until PayPal returns them.
+orderSchema.index({ paypalOrderId: 1 }, { unique: true, sparse: true });
+orderSchema.index({ paypalCaptureId: 1 }, { unique: true, sparse: true });
+orderSchema.index({ user: 1, createdAt: -1 }); // getMyOrders
+orderSchema.index({ status: 1, createdAt: -1 }); // dashboard stats + stale-pending cleanup
 
 export default mongoose.model("Order", orderSchema);

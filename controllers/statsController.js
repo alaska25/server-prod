@@ -6,30 +6,49 @@ import Template from "../models/Template.js";
 const DAYS_BACK = 30;
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
 
+// Timezone used to decide which calendar day an order or signup belongs to.
+// Default UTC (the previous behaviour). Set STATS_TIMEZONE to an IANA name such
+// as "Asia/Tokyo" or "America/New_York" to bucket days in your own timezone.
+const TZ = (() => {
+  const tz = process.env.STATS_TIMEZONE || "UTC";
+  try {
+    new Intl.DateTimeFormat("en-CA", { timeZone: tz });
+    return tz;
+  } catch {
+    console.warn(`Invalid STATS_TIMEZONE "${tz}", using UTC`);
+    return "UTC";
+  }
+})();
+
+const dayFormatter = new Intl.DateTimeFormat("en-CA", {
+  timeZone: TZ,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+const dayKey = (date) => dayFormatter.format(date); // "YYYY-MM-DD" in TZ
+
 // Dashboard numbers don't need to be accurate to the second, so cache the
 // full response briefly. Turns repeated visits/refreshes within the same
 // minute into an instant response instead of re-running the aggregations
 // every time.
 let statsCache = { data: null, at: 0 };
 
-// Call this after an order is marked paid (e.g. at the end of capture-order)
-// so the admin dashboard shows the new sale immediately instead of after
-// the cache expires.
+// Called after an order is marked paid (see orderController.js) so the admin
+// dashboard shows the new sale immediately instead of after the cache expires.
 export const clearStatsCache = () => {
   statsCache = { data: null, at: 0 };
 };
 
-const dayKey = (date) => date.toISOString().slice(0, 10); // "YYYY-MM-DD"
-
 // Builds an array of the last `days` day-keys (oldest first), so charts get
 // a continuous line even on days with zero orders/signups instead of gaps.
-const lastNDayKeys = (days) => {
+// Uses plain calendar arithmetic on today's date in TZ, so daylight-saving
+// changes can never produce a duplicate or a missing day.
+export const lastNDayKeys = (days, now = new Date()) => {
+  const [y, m, d] = dayKey(now).split("-").map(Number);
   const keys = [];
-  const now = new Date();
   for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(now);
-    d.setUTCDate(d.getUTCDate() - i);
-    keys.push(dayKey(d));
+    keys.push(new Date(Date.UTC(y, m - 1, d - i)).toISOString().slice(0, 10));
   }
   return keys;
 };
@@ -38,14 +57,18 @@ const round2 = (n) => Math.round((n || 0) * 100) / 100;
 
 // GET /stats/dashboard — superadmin-only, see statsRoutes.js.
 export const getDashboardStats = async (req, res) => {
+  res.set("Cache-Control", "no-store");
+
   try {
     if (statsCache.data && Date.now() - statsCache.at < CACHE_TTL_MS) {
       return res.json(statsCache.data);
     }
 
-    const since = new Date();
-    since.setUTCDate(since.getUTCDate() - (DAYS_BACK - 1));
-    since.setUTCHours(0, 0, 0, 0);
+    // A little wider than the window (a day boundary in any timezone is within
+    // 14h of UTC); only the day keys below are ever read from the results.
+    const since = new Date(Date.now() - (DAYS_BACK + 2) * 24 * 60 * 60 * 1000);
+
+    const byDay = { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: TZ } };
 
     const [
       revenueAgg,
@@ -72,21 +95,11 @@ export const getDashboardStats = async (req, res) => {
       Template.countDocuments(),
       Order.aggregate([
         { $match: { status: "paid", createdAt: { $gte: since } } },
-        {
-          $group: {
-            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-            revenue: { $sum: "$totalAmount" },
-          },
-        },
+        { $group: { _id: byDay, revenue: { $sum: "$totalAmount" } } },
       ]),
       User.aggregate([
         { $match: { createdAt: { $gte: since } } },
-        {
-          $group: {
-            _id: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
-            count: { $sum: 1 },
-          },
-        },
+        { $group: { _id: byDay, count: { $sum: 1 } } },
       ]),
       Order.aggregate([
         { $match: { status: "paid" } },
@@ -96,6 +109,7 @@ export const getDashboardStats = async (req, res) => {
             _id: "$books.book",
             unitsSold: { $sum: 1 },
             revenue: { $sum: "$books.price" },
+            snapshotTitle: { $first: "$books.title" },
           },
         },
         { $sort: { unitsSold: -1 } },
@@ -108,12 +122,13 @@ export const getDashboardStats = async (req, res) => {
             as: "book",
           },
         },
-        { $unwind: "$book" },
+        // Keep the row even if the book was deleted since the sale.
+        { $unwind: { path: "$book", preserveNullAndEmptyArrays: true } },
         {
           $project: {
             _id: 0,
             bookId: "$_id",
-            title: "$book.title",
+            title: { $ifNull: ["$book.title", { $ifNull: ["$snapshotTitle", "(deleted book)"] }] },
             unitsSold: 1,
             revenue: 1,
           },
@@ -127,6 +142,7 @@ export const getDashboardStats = async (req, res) => {
             _id: "$templates.template",
             unitsSold: { $sum: 1 },
             revenue: { $sum: "$templates.price" },
+            snapshotTitle: { $first: "$templates.title" },
           },
         },
         { $sort: { unitsSold: -1 } },
@@ -139,12 +155,14 @@ export const getDashboardStats = async (req, res) => {
             as: "template",
           },
         },
-        { $unwind: "$template" },
+        { $unwind: { path: "$template", preserveNullAndEmptyArrays: true } },
         {
           $project: {
             _id: 0,
             templateId: "$_id",
-            title: "$template.title",
+            title: {
+              $ifNull: ["$template.title", { $ifNull: ["$snapshotTitle", "(deleted template)"] }],
+            },
             unitsSold: 1,
             revenue: 1,
           },
@@ -194,7 +212,7 @@ export const getDashboardStats = async (req, res) => {
         totalRevenue: round2(revenueAgg[0]?.total),
         totalOrders, // every order, including pending and failed
         paidOrders, // only orders that count toward revenue
-        activeUsers,
+        activeUsers, // accounts that are not deactivated (not "active in the last 30 days")
         totalBooks,
         totalTemplates,
       },

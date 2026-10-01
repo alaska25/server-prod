@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import multer from "multer";
 import multerS3 from "multer-s3";
 import path from "path";
@@ -5,74 +6,82 @@ import sharp from "sharp";
 import { PutObjectCommand, DeleteObjectCommand } from "@aws-sdk/client-s3";
 import s3 from "../utils/s3.js";
 
-const ALLOWED_COVER_TYPES = [".jpg", ".jpeg", ".png", ".webp"];
-const ALLOWED_BOOK_TYPES = [".pdf", ".epub"];
-const ALLOWED_TEMPLATE_TYPES = [".zip"];
-
-// Covers are resized to at most this width (height follows the aspect ratio).
-// 600px is plenty for a 2:3 book card, even on retina screens.
-const COVER_MAX_WIDTH = 600;
-const COVER_WEBP_QUALITY = 80;
-
+const MB = 1024 * 1024;
 const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
+const httpError = (message, status) => Object.assign(new Error(message), { status });
 
-const fileFilter = (req, file, cb) => {
-  const ext = path.extname(file.originalname).toLowerCase();
-  if (file.fieldname === "cover" && ALLOWED_COVER_TYPES.includes(ext)) {
-    return cb(null, true);
-  }
-  if (file.fieldname === "bookFile" && ALLOWED_BOOK_TYPES.includes(ext)) {
-    return cb(null, true);
-  }
-  // Sample files use the same allowed types as the main book file
-  // (bookController treats a sample's extension as "epub" or "pdf").
-  if (file.fieldname === "sampleFile" && ALLOWED_BOOK_TYPES.includes(ext)) {
-    return cb(null, true);
-  }
-  if (file.fieldname === "templateFile" && ALLOWED_TEMPLATE_TYPES.includes(ext)) {
-    return cb(null, true);
-  }
-  cb(new Error(`Unsupported file type for ${file.fieldname}: ${ext}`));
+// Per-field rules. `image` fields are resized and converted to WebP;
+// everything else is streamed to S3 unchanged.
+//
+// IMPORTANT: covers/ and photos/ are meant to be publicly readable.
+// books/, samples/ and templates/ must NOT be public: they are only ever
+// served through signed URLs (see bookController / templateController).
+const RULES = {
+  cover: { types: [".jpg", ".jpeg", ".png", ".webp"], folder: "covers", image: { width: 600, maxBytes: 10 * MB } },
+  photo: { types: [".jpg", ".jpeg", ".png", ".webp"], folder: "photos", image: { width: 400, maxBytes: 5 * MB } },
+  bookFile: { types: [".pdf", ".epub"], folder: "books" },
+  sampleFile: { types: [".pdf", ".epub"], folder: "samples" },
+  templateFile: { types: [".zip"], folder: "templates" },
 };
 
-const makeKey = (file, ext) => {
-  const folder =
-    file.fieldname === "cover"
-      ? "covers"
-      : file.fieldname === "sampleFile"
-      ? "samples"
-      : file.fieldname === "templateFile"
-      ? "templates"
-      : "books";
-  const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
-  return `${folder}/${unique}${ext}`;
+const CONTENT_TYPES = {
+  ".pdf": "application/pdf",
+  ".epub": "application/epub+zip",
+  ".zip": "application/zip",
+};
+
+const extOf = (file) => path.extname(file.originalname).toLowerCase();
+const makeKey = (file, ext) => `${RULES[file.fieldname].folder}/${crypto.randomUUID()}${ext}`;
+
+const fileFilter = (req, file, cb) => {
+  const rule = RULES[file.fieldname];
+  if (!rule) return cb(httpError(`Unexpected field: ${file.fieldname}`, 400));
+  if (!rule.types.includes(extOf(file))) {
+    return cb(httpError(`Unsupported file type for ${file.fieldname}`, 400));
+  }
+  cb(null, true);
 };
 
 // ---- Standard storage: streams the file straight to S3, unchanged --------
 const passthroughStorage = multerS3({
   s3,
   bucket: process.env.S3_BUCKET,
-  contentType: multerS3.AUTO_CONTENT_TYPE,
-  key: (req, file, cb) => {
-    cb(null, makeKey(file, path.extname(file.originalname)));
-  },
+  contentType: (req, file, cb) => cb(null, CONTENT_TYPES[extOf(file)] || "application/octet-stream"),
+  key: (req, file, cb) => cb(null, makeKey(file, extOf(file))),
 });
 
-// ---- Cover storage: resize + convert to WebP, then upload ----------------
-// Custom multer storage engine. It sets `key`, `location` and `size` on the
-// file object, the same fields bookController already reads.
-const coverStorage = {
+// ---- Image storage: size cap, resize + convert to WebP, then upload ------
+const imageStorage = {
   _handleFile(req, file, cb) {
+    const { width, maxBytes } = RULES[file.fieldname].image;
     const key = makeKey(file, ".webp");
 
-    const resizer = sharp()
-      .rotate() // respect the photo's EXIF orientation
-      .resize({ width: COVER_MAX_WIDTH, withoutEnlargement: true })
-      .webp({ quality: COVER_WEBP_QUALITY });
+    // multer must only be called back once, even if several things fail.
+    let done = false;
+    const finish = (err, info) => {
+      if (!done) {
+        done = true;
+        cb(err, info);
+      }
+    };
 
-    file.stream.on("error", cb);
-    resizer.on("error", cb);
+    const resizer = sharp({ limitInputPixels: 40_000_000 })
+      .rotate() // respect EXIF orientation (EXIF/GPS data is dropped on output)
+      .resize({ width, withoutEnlargement: true })
+      .webp({ quality: 80 });
 
+    let bytes = 0;
+    file.stream.on("data", (chunk) => {
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        file.stream.unpipe(resizer);
+        file.stream.resume(); // drain so the request doesn't hang
+        resizer.destroy();
+        finish(httpError("Image is too large", 413));
+      }
+    });
+    file.stream.on("error", finish);
+    resizer.on("error", finish);
     file.stream.pipe(resizer);
 
     resizer
@@ -90,7 +99,7 @@ const coverStorage = {
             })
           )
           .then(() =>
-            cb(null, {
+            finish(null, {
               key,
               location: publicUrl(key),
               size: buffer.length,
@@ -99,33 +108,31 @@ const coverStorage = {
             })
           )
       )
-      .catch(cb);
+      .catch(finish);
   },
 
   _removeFile(req, file, cb) {
-    // Called by multer if a later step fails; clean up the uploaded object.
     s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: file.key }))
       .then(() => cb(null))
       .catch(cb);
   },
 };
 
-// ---- Router: covers -> resize; everything else -> untouched --------------
-const storage = {
-  _handleFile(req, file, cb) {
-    if (file.fieldname === "cover") return coverStorage._handleFile(req, file, cb);
-    return passthroughStorage._handleFile(req, file, cb);
-  },
-  _removeFile(req, file, cb) {
-    if (file.fieldname === "cover") return coverStorage._removeFile(req, file, cb);
-    return passthroughStorage._removeFile(req, file, cb);
-  },
-};
+const pick = (file) => (RULES[file.fieldname]?.image ? imageStorage : passthroughStorage);
 
 const upload = multer({
   fileFilter,
-  limits: { fileSize: 200 * 1024 * 1024 }, // 200MB max (ebooks can be large)
-  storage,
+  storage: {
+    _handleFile: (req, file, cb) => pick(file)._handleFile(req, file, cb),
+    _removeFile: (req, file, cb) => pick(file)._removeFile(req, file, cb),
+  },
+  limits: {
+    fileSize: 200 * MB, // ebooks can be large
+    files: 3,
+    fields: 25,
+    fieldSize: 1 * MB,
+    parts: 30,
+  },
 });
 
 export default upload;
