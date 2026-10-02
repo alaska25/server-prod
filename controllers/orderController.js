@@ -2,6 +2,7 @@ import Book from "../models/Book.js";
 import Template from "../models/Template.js";
 import Order from "../models/Order.js";
 import User from "../models/User.js";
+import { clearStatsCache } from "./statsController.js";
 import {
   createPaypalOrder,
   capturePaypalOrder,
@@ -73,7 +74,9 @@ export const createPaypalCheckout = async (req, res) => {
             .lean()
         : [],
       templateIds.length
-        ? Template.find({ _id: { $in: templateIds } }).select("title coverUrl price").lean()
+        ? Template.find({ _id: { $in: templateIds }, published: { $ne: false } })
+            .select("title coverUrl price")
+            .lean()
         : [],
     ]);
 
@@ -206,6 +209,7 @@ export const capturePaypalCheckout = async (req, res) => {
       console.error("Duplicate paypalCaptureId", { orderId: String(order._id), captureId: cap.id });
     }
 
+    clearStatsCache(); // the admin dashboard shows the new sale right away
     res.json({ message: "Payment captured", orderId: order._id });
   } catch (err) {
     fail(res, err, "capturePaypalCheckout", "Could not complete payment");
