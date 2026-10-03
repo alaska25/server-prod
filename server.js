@@ -16,6 +16,7 @@ import newsletterRoutes from "./routes/newsletterRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
 import statsRoutes from "./routes/statsRoutes.js";
 import templateRoutes from "./routes/templateRoutes.js";
+import accountRoutes from "./routes/accountRoutes.js";
 
 // ---- Fail fast on missing configuration ----------------------------------
 // TODO: also add any email/SMTP variables used by utils/sendEmail.js.
@@ -99,6 +100,8 @@ app.use("/api/newsletter", newsletterRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/templates", templateRoutes);
+app.use("/api/templates", templateRoutes);
+app.use("/api/account", accountRoutes);
 
 app.use((req, res) => res.status(404).json({ message: "Not found" }));
 
