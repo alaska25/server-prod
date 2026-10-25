@@ -168,12 +168,22 @@ export const getTemplateAccess = async (req, res) => {
       }
     }
 
+    // A template created before uploads worked (or after a failed upload)
+    // has no file. Say so clearly instead of crashing the S3 call.
+    if (!template.fileKey) {
+      return res
+        .status(404)
+        .json({ message: "This template's file isn't available yet. Please contact support." });
+    }
+
     const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: template.fileKey });
     const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 60 }); // 1 hour
 
     res.json({ url: signedUrl, fileType: template.fileType, title: template.title });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    // Full detail goes to the server log; customers get a safe message.
+    console.error("getTemplateAccess failed:", err);
+    res.status(500).json({ message: "Could not create the download link" });
   }
 };
 
@@ -183,12 +193,19 @@ export const getTemplateFileAdmin = async (req, res) => {
     const template = await Template.findById(req.params.id).lean();
     if (!template) return res.status(404).json({ message: "Template not found" });
 
+    if (!template.fileKey) {
+      return res.status(404).json({ message: "This template has no file uploaded yet" });
+    }
+
     const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: template.fileKey });
     const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 10 }); // 10 minutes
 
     res.json({ url: signedUrl, fileType: template.fileType, title: template.title });
   } catch (err) {
-    res.status(500).json({ message: err.message });
+    // The terminal shows the real cause (e.g. missing S3_BUCKET / S3_REGION /
+    // credentials, or AccessDenied). The browser gets a safe message.
+    console.error("getTemplateFileAdmin failed:", err);
+    res.status(500).json({ message: "Could not create the download link" });
   }
 };
 
