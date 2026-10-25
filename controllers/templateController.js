@@ -10,12 +10,8 @@ const publicUrl = (key) => `${process.env.S3_PUBLIC_URL_BASE}/${key}`;
 
 // Fields the template cards / listing pages need. Deliberately excludes the
 // heavy `readme` and `fileTree`, and the private file location.
-// If a listing page shows something not in this list, add it here.
 const LIST_FIELDS =
   "title tagline category techStack version price isFree featured coverUrl createdAt";
-
-// Never send the private zip location to the public.
-const HIDE_PRIVATE = "-fileUrl -fileKey";
 
 const MAX_LIMIT = 50;
 
@@ -24,6 +20,9 @@ const parsePaging = (page, limit, defaultLimit, maxLimit = MAX_LIMIT) => {
   const safePage = Math.max(Number(page) || 1, 1);
   return { safeLimit, safePage, skip: (safePage - 1) * safeLimit };
 };
+
+// Safe download filename from the template title.
+const zipName = (title) => `${String(title || "template").replace(/[^\w.-]+/g, "_")}.zip`;
 
 // Simple in-memory cache for the category list (rarely changes).
 let categoriesCache = { data: null, at: 0 };
@@ -51,8 +50,7 @@ async function uploadBufferToS3(buffer, originalName, contentType, folder) {
   return { key, url: publicUrl(key) };
 }
 
-// Resizes a cover image to a small WebP before uploading (same settings as
-// the book covers in middleware/upload.js).
+// Resizes a cover image to a small WebP before uploading.
 async function uploadCoverToS3(buffer) {
   const optimized = await sharp(buffer)
     .rotate() // respect EXIF orientation
@@ -139,14 +137,17 @@ export const getTemplatesAdmin = async (req, res) => {
   }
 };
 
-// GET /api/templates/:id (public) - full detail (including readme and
-// fileTree for the preview), minus the private file location.
-// NOTE: if your admin edit form reads fileUrl/fileKey from this endpoint,
-// use the admin download route (GET /api/templates/:id/file) instead.
+// GET /api/templates/:id (public) - full detail minus the private file location.
+// fileKey/fileUrl are `select: false` in the schema, so they are never returned
+// unless asked for. We ask for fileKey only to compute `hasFile`, then drop it.
 export const getTemplateById = async (req, res) => {
   try {
-    const template = await Template.findById(req.params.id).select(HIDE_PRIVATE).lean();
+    const template = await Template.findById(req.params.id).select("+fileKey").lean();
     if (!template) return res.status(404).json({ message: "Template not found" });
+
+    template.hasFile = Boolean(template.fileKey?.trim());
+    delete template.fileKey; // never send the private key to the client
+
     res.json(template);
   } catch (err) {
     res.status(500).json({ message: err.message });
@@ -154,34 +155,34 @@ export const getTemplateById = async (req, res) => {
 };
 
 // GET /api/templates/:id/access (protected) - signed download URL, only if
-// the user owns it (or it's free). Mirrors getBookAccess exactly.
+// the user owns it (or it's free).
 export const getTemplateAccess = async (req, res) => {
   try {
-    const template = await Template.findById(req.params.id).lean();
+    const template = await Template.findById(req.params.id).select("+fileKey").lean();
     if (!template) return res.status(404).json({ message: "Template not found" });
 
     if (!template.isFree) {
-      // One lightweight query instead of loading the whole user document.
       const owns = await User.exists({ _id: req.user._id, ownedTemplates: template._id });
       if (!owns) {
         return res.status(403).json({ message: "You don't own this template yet" });
       }
     }
 
-    // A template created before uploads worked (or after a failed upload)
-    // has no file. Say so clearly instead of crashing the S3 call.
-    if (!template.fileKey) {
+    if (!template.fileKey?.trim()) {
       return res
         .status(404)
         .json({ message: "This template's file isn't available yet. Please contact support." });
     }
 
-    const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: template.fileKey });
+    const command = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: template.fileKey,
+      ResponseContentDisposition: `attachment; filename="${zipName(template.title)}"`,
+    });
     const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 60 }); // 1 hour
 
     res.json({ url: signedUrl, fileType: template.fileType, title: template.title });
   } catch (err) {
-    // Full detail goes to the server log; customers get a safe message.
     console.error("getTemplateAccess failed:", err);
     res.status(500).json({ message: "Could not create the download link" });
   }
@@ -190,20 +191,22 @@ export const getTemplateAccess = async (req, res) => {
 // GET /api/templates/:id/file (admin) - download the current zip before replacing it
 export const getTemplateFileAdmin = async (req, res) => {
   try {
-    const template = await Template.findById(req.params.id).lean();
+    const template = await Template.findById(req.params.id).select("+fileKey").lean();
     if (!template) return res.status(404).json({ message: "Template not found" });
 
-    if (!template.fileKey) {
+    if (!template.fileKey?.trim()) {
       return res.status(404).json({ message: "This template has no file uploaded yet" });
     }
 
-    const command = new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: template.fileKey });
+    const command = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: template.fileKey,
+      ResponseContentDisposition: `attachment; filename="${zipName(template.title)}"`,
+    });
     const signedUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 10 }); // 10 minutes
 
     res.json({ url: signedUrl, fileType: template.fileType, title: template.title });
   } catch (err) {
-    // The terminal shows the real cause (e.g. missing S3_BUCKET / S3_REGION /
-    // credentials, or AccessDenied). The browser gets a safe message.
     console.error("getTemplateFileAdmin failed:", err);
     res.status(500).json({ message: "Could not create the download link" });
   }
@@ -241,7 +244,8 @@ export const uploadTemplateCover = async (req, res) => {
 // POST /api/templates/:id/file (admin) - expects a buffer (memory storage)
 export const uploadTemplateFile = async (req, res) => {
   try {
-    const template = await Template.findById(req.params.id);
+    // +fileKey so we can delete the old zip from S3 when replacing it
+    const template = await Template.findById(req.params.id).select("+fileKey +fileUrl");
     if (!template) return res.status(404).json({ message: "Template not found" });
 
     const templateFile = req.files?.templateFile?.[0];
@@ -256,13 +260,7 @@ export const uploadTemplateFile = async (req, res) => {
       "templates"
     );
 
-    if (template.fileKey) {
-      try {
-        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: template.fileKey }));
-      } catch (s3Err) {
-        console.warn("S3 cleanup warning (old template file):", s3Err.message);
-      }
-    }
+    const oldKey = template.fileKey;
 
     template.fileKey = key;
     template.fileUrl = url;
@@ -270,9 +268,25 @@ export const uploadTemplateFile = async (req, res) => {
     template.readme = readme;
     template.fileTree = fileTree;
 
-    const updated = await template.save();
-    res.json(updated);
+    await template.save();
+
+    // Delete the old zip only after the new one is saved, so a failed save
+    // never leaves the template without a file.
+    if (oldKey && oldKey !== key) {
+      try {
+        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: oldKey }));
+      } catch (s3Err) {
+        console.warn("S3 cleanup warning (old template file):", s3Err.message);
+      }
+    }
+
+    // Don't send the private location back to the browser.
+    const out = template.toObject();
+    delete out.fileKey;
+    delete out.fileUrl;
+    res.json({ ...out, hasFile: true });
   } catch (err) {
+    console.error("uploadTemplateFile failed:", err);
     res.status(500).json({ message: err.message });
   }
 };
@@ -353,8 +367,13 @@ export const createTemplate = async (req, res) => {
     });
 
     clearCategoriesCache();
-    res.status(201).json(template);
+
+    const out = template.toObject();
+    delete out.fileKey;
+    delete out.fileUrl;
+    res.status(201).json({ ...out, hasFile: true });
   } catch (err) {
+    console.error("createTemplate failed:", err);
     res.status(500).json({ message: err.message });
   }
 };
@@ -398,14 +417,18 @@ export const updateTemplate = async (req, res) => {
 
 export const deleteTemplate = async (req, res) => {
   try {
-    const template = await Template.findById(req.params.id);
+    // +fileKey so the zip is actually removed from S3
+    const template = await Template.findById(req.params.id).select("+fileKey");
     if (!template) return res.status(404).json({ message: "Template not found" });
 
-    try {
-      await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: template.coverKey }));
-      await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: template.fileKey }));
-    } catch (s3Err) {
-      console.warn("S3 cleanup warning:", s3Err.message);
+    // Delete each object separately so one failure doesn't skip the other.
+    for (const key of [template.coverKey, template.fileKey]) {
+      if (!key) continue;
+      try {
+        await s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }));
+      } catch (s3Err) {
+        console.warn("S3 cleanup warning:", s3Err.message);
+      }
     }
 
     await template.deleteOne();
