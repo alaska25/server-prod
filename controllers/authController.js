@@ -1,3 +1,4 @@
+
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
 import { OAuth2Client } from "google-auth-library";
@@ -366,6 +367,25 @@ export const getMyLibrary = async (req, res) => {
     res.json(user?.library ?? []);
   } catch (err) {
     serverError(res, err, "getMyLibrary");
+  }
+};
+
+// GET /api/auth/library/templates — owned templates, WITHOUT the private zip
+// location. fileKey/fileUrl are select:false in the schema, so they are never
+// included here. Not filtered by `published`, so customers keep access to
+// templates they bought even if you unpublish them later.
+export const getTemplateLibrary = async (req, res) => {
+  try {
+    const user = await User.findById(req.user._id)
+      .select("ownedTemplates")
+      .populate({
+        path: "ownedTemplates",
+        select: "title tagline category coverUrl version createdAt",
+      })
+      .lean();
+    res.json(user?.ownedTemplates ?? []);
+  } catch (err) {
+    serverError(res, err, "getTemplateLibrary");
   }
 };
 

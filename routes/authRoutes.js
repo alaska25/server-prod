@@ -7,6 +7,7 @@ import {
   resetPassword,
   getProfile,
   getMyLibrary,
+  getTemplateLibrary,
   uploadUserPhoto,
 } from "../controllers/authController.js";
 import { protect } from "../middleware/auth.js";
@@ -53,6 +54,7 @@ router.post("/forgot-password", forgotIpLimiter, forgotEmailLimiter, forgotPassw
 router.post("/reset-password", resetLimiter, resetPassword);
 router.get("/profile", protect, noStore, getProfile);
 router.get("/library", protect, noStore, getMyLibrary);
+router.get("/library/templates", protect, noStore, getTemplateLibrary);
 router.post(
   "/photo",
   protect,
