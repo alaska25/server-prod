@@ -17,6 +17,7 @@ import userRoutes from "./routes/userRoutes.js";
 import statsRoutes from "./routes/statsRoutes.js";
 import templateRoutes from "./routes/templateRoutes.js";
 import accountRoutes from "./routes/accountRoutes.js";
+import trafficRoutes from "./routes/trafficRoutes.js";
 
 // ---- Fail fast on missing configuration ----------------------------------
 // TODO: also add any email/SMTP variables used by utils/sendEmail.js.
@@ -66,9 +67,10 @@ app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(compression());
 
 // CLIENT_URL may hold several origins, comma separated
-// (e.g. "https://example.com,https://example.com").
+// (e.g. "https://www.example.com,https://example.com").
+// A trailing slash is removed, because browsers never send one in the Origin header.
 const allowedOrigins = process.env.CLIENT_URL.split(",")
-  .map((s) => s.trim().replace(/\/\$/, ""))
+  .map((s) => s.trim().replace(/\/+$/, ""))
   .filter(Boolean);
 
 app.use(
@@ -100,8 +102,8 @@ app.use("/api/newsletter", newsletterRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/stats", statsRoutes);
 app.use("/api/templates", templateRoutes);
-app.use("/api/templates", templateRoutes);
 app.use("/api/account", accountRoutes);
+app.use("/api/traffic", trafficRoutes); // anonymous page-view counting for the admin Traffic tab
 
 app.use((req, res) => res.status(404).json({ message: "Not found" }));
 
@@ -129,7 +131,7 @@ let server;
 
 try {
   await connectDB(); // connectDB must throw on failure (not swallow the error)
-  
+
   // Binding to '0.0.0.0' allows external proxy servers like Render to forward traffic here
   server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Adyoolau API running on port ${PORT}`);

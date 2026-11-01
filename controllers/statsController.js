@@ -2,6 +2,7 @@ import Order from "../models/Order.js";
 import User from "../models/User.js";
 import Book from "../models/Book.js";
 import Template from "../models/Template.js";
+import PageView from "../models/PageView.js";
 
 const DAYS_BACK = 30;
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
@@ -67,6 +68,8 @@ export const getDashboardStats = async (req, res) => {
     // A little wider than the window (a day boundary in any timezone is within
     // 14h of UTC); only the day keys below are ever read from the results.
     const since = new Date(Date.now() - (DAYS_BACK + 2) * 24 * 60 * 60 * 1000);
+    // Exactly 30 days, for the traffic top lists (pages, sources, devices).
+    const trafficSince = new Date(Date.now() - DAYS_BACK * 24 * 60 * 60 * 1000);
 
     const byDay = { $dateToString: { format: "%Y-%m-%d", date: "$createdAt", timezone: TZ } };
 
@@ -83,6 +86,10 @@ export const getDashboardStats = async (req, res) => {
       topTemplatesRaw,
       orderStatusRaw,
       revenueSplitRaw,
+      trafficByDayRaw,
+      topPagesRaw,
+      topSourcesRaw,
+      devicesRaw,
     ] = await Promise.all([
       Order.aggregate([
         { $match: { status: "paid" } },
@@ -184,6 +191,35 @@ export const getDashboardStats = async (req, res) => {
           },
         },
       ]),
+      // ---- Traffic (from the page views the site records itself) ----
+      // Per day: page views, and unique visitors (the visitor hash changes
+      // daily, so this is "different people that day").
+      PageView.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        { $group: { _id: { day: byDay, v: "$visitor" }, views: { $sum: 1 } } },
+        { $group: { _id: "$_id.day", visitors: { $sum: 1 }, views: { $sum: "$views" } } },
+      ]),
+      PageView.aggregate([
+        { $match: { createdAt: { $gte: trafficSince } } },
+        { $group: { _id: "$path", views: { $sum: 1 } } },
+        { $sort: { views: -1 } },
+        { $limit: 8 },
+      ]),
+      PageView.aggregate([
+        { $match: { createdAt: { $gte: trafficSince } } },
+        {
+          $group: {
+            _id: { $cond: [{ $eq: ["$source", ""] }, "Direct", "$source"] },
+            views: { $sum: 1 },
+          },
+        },
+        { $sort: { views: -1 } },
+        { $limit: 8 },
+      ]),
+      PageView.aggregate([
+        { $match: { createdAt: { $gte: trafficSince } } },
+        { $group: { _id: "$device", views: { $sum: 1 } } },
+      ]),
     ]);
 
     // Fill every day in the window, defaulting to 0 where there's no data.
@@ -207,6 +243,29 @@ export const getDashboardStats = async (req, res) => {
       { source: "templates", revenue: round2(revenueSplitRaw[0]?.templates[0]?.revenue) },
     ];
 
+    const trafficByDate = Object.fromEntries(trafficByDayRaw.map((r) => [r._id, r]));
+    const trafficByDay = dayKeys.map((date) => ({
+      date,
+      views: trafficByDate[date]?.views || 0,
+      visitors: trafficByDate[date]?.visitors || 0,
+    }));
+    const sumOf = (rows, key) => rows.reduce((s, r) => s + r[key], 0);
+    const last7 = trafficByDay.slice(-7);
+    const traffic = {
+      totals: {
+        viewsToday: trafficByDay[trafficByDay.length - 1]?.views || 0,
+        visitorsToday: trafficByDay[trafficByDay.length - 1]?.visitors || 0,
+        views7: sumOf(last7, "views"),
+        visitors7: sumOf(last7, "visitors"), // each day's unique visitors, added up
+        views30: sumOf(trafficByDay, "views"),
+        visitors30: sumOf(trafficByDay, "visitors"),
+      },
+      byDay: trafficByDay,
+      topPages: topPagesRaw.map((r) => ({ label: r._id, views: r.views })),
+      topSources: topSourcesRaw.map((r) => ({ label: r._id, views: r.views })),
+      devices: devicesRaw.map((r) => ({ label: r._id, views: r.views })),
+    };
+
     const payload = {
       totals: {
         totalRevenue: round2(revenueAgg[0]?.total),
@@ -222,6 +281,7 @@ export const getDashboardStats = async (req, res) => {
       topTemplates: topTemplatesRaw,
       orderStatus,
       revenueSplit,
+      traffic,
     };
 
     statsCache = { data: payload, at: Date.now() };
