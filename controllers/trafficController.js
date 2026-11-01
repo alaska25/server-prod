@@ -19,19 +19,29 @@ const OWN_HOSTS = (process.env.CLIENT_URL || "")
 
 const today = () => new Date().toISOString().slice(0, 10);
 
+// Always answers 204. The X-Traffic header says what happened, so a skipped
+// visit can be explained from the browser's Network tab (look under the
+// request's Response Headers). It is never shown to visitors.
+const done = (res, why) => {
+  res.set("X-Traffic", why);
+  return res.status(204).end();
+};
+
 // POST /api/traffic/collect  { path, referrer?, utm? }  (public)
 // Always answers 204 quickly: a failure here must never affect a visitor.
 export const collectPageView = async (req, res) => {
   try {
     const ua = String(req.get("user-agent") || "");
-    if (!ua || BOT.test(ua) || req.get("dnt") === "1") return res.status(204).end();
+    if (!ua) return done(res, "skipped:no-user-agent");
+    if (BOT.test(ua)) return done(res, "skipped:bot");
+    if (req.get("dnt") === "1") return done(res, "skipped:do-not-track");
 
     const { path, referrer, utm } = req.body || {};
     if (typeof path !== "string" || !path.startsWith("/") || path.length > 200) {
-      return res.status(204).end();
+      return done(res, "skipped:bad-path");
     }
     const cleanPath = path.split("?")[0].split("#")[0] || "/";
-    if (cleanPath.startsWith("/admin")) return res.status(204).end();
+    if (cleanPath.startsWith("/admin")) return done(res, "skipped:admin-page");
 
     let source = "";
     if (typeof utm === "string" && utm) {
@@ -58,9 +68,9 @@ export const collectPageView = async (req, res) => {
       device: /mobi|android|iphone|ipad/i.test(ua) ? "mobile" : "desktop",
       visitor,
     });
-    res.status(204).end();
+    done(res, "recorded");
   } catch (err) {
     console.error("collectPageView:", err.message);
-    res.status(204).end();
+    done(res, "error");
   }
 };
