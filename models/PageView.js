@@ -7,6 +7,7 @@ const pageViewSchema = new mongoose.Schema(
   {
     path: { type: String, required: true, maxlength: 200 },
     source: { type: String, default: "", maxlength: 100 }, // referring site or utm_source; "" = direct
+    country: { type: String, default: "", maxlength: 2 }, // 2-letter code such as "JP"; "" = unknown
     device: { type: String, enum: ["mobile", "desktop"], default: "desktop" },
     visitor: { type: String, required: true },
   },

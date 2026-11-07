@@ -3,6 +3,7 @@ import User from "../models/User.js";
 import Book from "../models/Book.js";
 import Template from "../models/Template.js";
 import PageView from "../models/PageView.js";
+import CartEvent from "../models/CartEvent.js";
 
 const DAYS_BACK = 30;
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
@@ -90,6 +91,10 @@ export const getDashboardStats = async (req, res) => {
       topPagesRaw,
       topSourcesRaw,
       devicesRaw,
+      countriesRaw,
+      cartByDayRaw,
+      topCartRaw,
+      paid30,
     ] = await Promise.all([
       Order.aggregate([
         { $match: { status: "paid" } },
@@ -220,6 +225,28 @@ export const getDashboardStats = async (req, res) => {
         { $match: { createdAt: { $gte: trafficSince } } },
         { $group: { _id: "$device", views: { $sum: 1 } } },
       ]),
+      // Different visitors per country (the daily visitor hash, counted once each)
+      PageView.aggregate([
+        { $match: { createdAt: { $gte: trafficSince } } },
+        { $group: { _id: { c: "$country", v: "$visitor" } } },
+        { $group: { _id: "$_id.c", views: { $sum: 1 } } },
+        { $sort: { views: -1 } },
+        { $limit: 10 },
+      ]),
+      // ---- Add to cart ----
+      // Per day: how many items were added, and by how many different visitors.
+      CartEvent.aggregate([
+        { $match: { createdAt: { $gte: since } } },
+        { $group: { _id: { day: byDay, v: "$visitor" }, adds: { $sum: 1 } } },
+        { $group: { _id: "$_id.day", adders: { $sum: 1 }, adds: { $sum: "$adds" } } },
+      ]),
+      CartEvent.aggregate([
+        { $match: { createdAt: { $gte: trafficSince } } },
+        { $group: { _id: { k: "$kind", i: "$itemId" }, title: { $last: "$title" }, adds: { $sum: 1 } } },
+        { $sort: { adds: -1 } },
+        { $limit: 8 },
+      ]),
+      Order.countDocuments({ status: "paid", createdAt: { $gte: trafficSince } }),
     ]);
 
     // Fill every day in the window, defaulting to 0 where there's no data.
@@ -251,6 +278,26 @@ export const getDashboardStats = async (req, res) => {
     }));
     const sumOf = (rows, key) => rows.reduce((s, r) => s + r[key], 0);
     const last7 = trafficByDay.slice(-7);
+
+    const cartByDate = Object.fromEntries(cartByDayRaw.map((r) => [r._id, r]));
+    const cartByDay = dayKeys.map((date) => ({
+      date,
+      adds: cartByDate[date]?.adds || 0,
+      adders: cartByDate[date]?.adders || 0,
+    }));
+    const cart = {
+      totals: {
+        addsToday: cartByDay[cartByDay.length - 1]?.adds || 0,
+        adds7: sumOf(cartByDay.slice(-7), "adds"),
+        adds30: sumOf(cartByDay, "adds"),
+        adders30: sumOf(cartByDay, "adders"), // each day's different visitors, added up
+      },
+      byDay: cartByDay,
+      topItems: topCartRaw.map((r) => ({ label: r.title || "(removed item)", kind: r._id.k, views: r.adds })),
+      // From visit to purchase over the last 30 days. People and orders are
+      // different counts, so the last step is an approximation.
+      funnel: { visitors: sumOf(trafficByDay, "visitors"), adders: sumOf(cartByDay, "adders"), paidOrders: paid30 },
+    };
     const traffic = {
       totals: {
         viewsToday: trafficByDay[trafficByDay.length - 1]?.views || 0,
@@ -264,6 +311,8 @@ export const getDashboardStats = async (req, res) => {
       topPages: topPagesRaw.map((r) => ({ label: r._id, views: r.views })),
       topSources: topSourcesRaw.map((r) => ({ label: r._id, views: r.views })),
       devices: devicesRaw.map((r) => ({ label: r._id, views: r.views })),
+      countries: countriesRaw.map((r) => ({ label: r._id || "", views: r.views })),
+      cart,
     };
 
     const payload = {
